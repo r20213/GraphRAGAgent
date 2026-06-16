@@ -118,8 +118,9 @@ def test_execute_read_passes_parameters(srv, monkeypatch, fake_driver_factory):
     monkeypatch.setattr(srv, "get_driver", lambda: driver)
 
     srv.execute_read("unit", "MATCH (n) WHERE n.id = $id RETURN n", {"id": "X"})
-    session = driver.session()  # new session, but we inspect the prior call path
-    # Confirm read access mode was requested on the driver session.
+    # Confirm read access mode was requested on the driver session opened by
+    # execute_read (do NOT open another session here, it would overwrite the
+    # captured kwargs).
     assert driver.session_kwargs["default_access_mode"] == srv.READ_ACCESS
 
 
