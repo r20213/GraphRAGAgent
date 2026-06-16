@@ -40,7 +40,7 @@ import signal
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -180,9 +180,9 @@ def _serialise(value: Any) -> Any:
 def execute_read(
     tool_name: str,
     cypher: str,
-    params: Optional[dict[str, Any]] = None,
-    agent_session_id: Optional[str] = None,
-    cap: Optional[int] = None,
+    params: dict[str, Any] | None = None,
+    agent_session_id: str | None = None,
+    cap: int | None = None,
 ) -> list[dict[str, Any]]:
     """Run a parameterised read query with full production guardrails.
 
@@ -370,7 +370,7 @@ _ROLE_TO_RELS: dict[str, list[str]] = {
 # Investment Research Agent tools
 # --------------------------------------------------------------------------- #
 @mcp.tool()
-def get_industries(agent_session_id: Optional[str] = None) -> str:
+def get_industries(agent_session_id: str | None = None) -> str:
     """List every available industry name and id.
 
     Routing: Investment Research Agent. Input: none.
@@ -386,7 +386,7 @@ def get_industries(agent_session_id: Optional[str] = None) -> str:
 
 @mcp.tool()
 def get_companies_in_industry(
-    industry_name: str, agent_session_id: Optional[str] = None
+    industry_name: str, agent_session_id: str | None = None
 ) -> str:
     """List companies belonging to ``industry_name`` (case-insensitive).
 
@@ -413,9 +413,9 @@ def get_companies_in_industry(
 @mcp.tool()
 def get_articles_with_sentiment(
     min_sentiment: float,
-    year: Optional[int] = None,
-    month: Optional[int] = None,
-    agent_session_id: Optional[str] = None,
+    year: int | None = None,
+    month: int | None = None,
+    agent_session_id: str | None = None,
 ) -> str:
     """Articles with sentiment >= ``min_sentiment``, optionally by year/month.
 
@@ -443,7 +443,7 @@ def get_articles_with_sentiment(
 def get_people_in_organizations(
     company_names: list[str],
     role: str = "any",
-    agent_session_id: Optional[str] = None,
+    agent_session_id: str | None = None,
 ) -> str:
     """Personnel matching ``role`` (e.g. "CEO") in the given companies.
 
@@ -473,7 +473,7 @@ def get_people_in_organizations(
 # --------------------------------------------------------------------------- #
 @mcp.tool()
 def find_investor_by_name(
-    company_name: str, agent_session_id: Optional[str] = None
+    company_name: str, agent_session_id: str | None = None
 ) -> str:
     """Find entities (Person/Organization) that invested in ``company_name``.
 
@@ -499,7 +499,7 @@ def find_investor_by_name(
 
 @mcp.tool()
 def find_investor_by_id(
-    investor_id: str, agent_session_id: Optional[str] = None
+    investor_id: str, agent_session_id: str | None = None
 ) -> str:
     """Return the full investment portfolio for a unique ``investor_id``.
 
@@ -569,8 +569,8 @@ def _live_schema() -> str:
 @mcp.tool()
 def run_cypher_query(
     cypher_query: str,
-    parameters: Optional[dict[str, Any]] = None,
-    agent_session_id: Optional[str] = None,
+    parameters: dict[str, Any] | None = None,
+    agent_session_id: str | None = None,
 ) -> str:
     """Execute an ad-hoc, read-only Cypher query for GraphRAG traversals.
 

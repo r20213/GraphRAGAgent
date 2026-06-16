@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 try:
     from neo4j import GraphDatabase
@@ -255,7 +255,7 @@ def get_neo4j_schema_markdown(
     password: str = DEFAULT_PASSWORD,
     database: str = DEFAULT_DATABASE,
     example_count: int = DEFAULT_EXAMPLE_COUNT,
-    output_path: Optional[str] = None,
+    output_path: str | None = None,
 ) -> str:
     """Connect to Neo4j, extract the schema and return it as Markdown.
 
