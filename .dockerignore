@@ -1,0 +1,28 @@
+# Version control / CI
+.git
+.github
+.gitignore
+
+# Python caches & build artifacts
+__pycache__/
+*.py[codz]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Tests & dev-only files
+tests/
+requirements-dev.txt
+pytest.ini
+
+# Secrets — never bake into the image
+.env
+**/.env
+*.envrc
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
