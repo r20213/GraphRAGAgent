@@ -44,7 +44,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
-from neo4j import GraphDatabase, Query, READ_ACCESS
+from neo4j import READ_ACCESS, GraphDatabase, Query
 from neo4j.exceptions import (
     AuthError,
     CypherSyntaxError,

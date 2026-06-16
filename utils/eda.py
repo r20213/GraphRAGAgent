@@ -15,7 +15,7 @@ from typing import Any
 
 try:
     from neo4j import GraphDatabase
-    from neo4j.exceptions import Neo4jError, ServiceUnavailable, AuthError
+    from neo4j.exceptions import AuthError, Neo4jError, ServiceUnavailable
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "The 'neo4j' package is required. Install it with: pip install neo4j"
