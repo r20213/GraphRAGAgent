@@ -21,7 +21,7 @@ ignore = [
 # Lazy PEP 562 re-export shims: the TYPE_CHECKING block intentionally
 # "imports" symbols only for static type-checkers, and __init__ aggregates
 # the public API — so unused-import / redundant-alias rules don't apply.
-"**/__init__.py" = [
+"__init__.py" = [
     "F401",  # imported but unused (re-exported on purpose)
     "F403",  # star imports (public API aggregation)
     "PLC0414",  # import alias does not rename (explicit re-export form)
