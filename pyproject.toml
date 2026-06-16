@@ -25,6 +25,7 @@ ignore = [
     "F401",  # imported but unused (re-exported on purpose)
     "F403",  # star imports (public API aggregation)
     "PLC0414",  # import alias does not rename (explicit re-export form)
+    "I001",  # import block sorting (lazy TYPE_CHECKING shim ordering)
 ]
 
 [tool.ruff.lint.isort]
