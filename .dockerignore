@@ -1,3 +1,7 @@
+# Shared build-context excludes for all images in this repo.
+# Both Dockerfiles (investment_agent/, mcp_server/) build from the repository
+# root, so Docker reads this single context-root .dockerignore for every build.
+
 # Version control / CI
 .git
 .github
@@ -17,7 +21,7 @@ tests/
 requirements-dev.txt
 pytest.ini
 
-# Secrets — never bake into the image
+# Secrets — never bake into the image (injected at deploy time)
 .env
 **/.env
 *.envrc
