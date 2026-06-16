@@ -282,7 +282,8 @@ mcp = FastMCP(
         "Read-only MCP server for the Neo4j `companies` graph. Prefer the "
         "declarative tools (get_industries, get_companies_in_industry, "
         "get_articles_with_sentiment, get_people_in_organizations, "
-        "find_investor_by_name, find_investor_by_id). Use get_neo4j_schema + "
+        "find_investor_by_name, find_investor_by_id, "
+        "find_investors_for_companies). Use get_neo4j_schema + "
         "run_cypher_query only for ad-hoc graph traversals not covered by a "
         "declarative tool. All inputs are passed as native Cypher parameters."
     ),
@@ -360,6 +361,22 @@ QUERY_TEMPLATES: dict[str, dict[str, str]] = {
             RETURN inv.name AS investor,
                    labels(inv) AS investor_type,
                    collect({company: o.name, company_id: o.id})[..100] AS portfolio
+        """,
+    },
+    "find_investors_for_companies": {
+        "description": "Overlapping investors who funded multiple of the companies.",
+        "query": """
+            MATCH (o:Organization)-[:HAS_INVESTOR]->(inv)
+            WHERE toLower(o.name) IN [c IN $company_names | toLower(c)]
+            WITH inv,
+                 collect(DISTINCT o.name) AS funded_companies
+            WHERE size(funded_companies) >= $min_overlap
+            RETURN inv.name AS investor,
+                   inv.id AS investor_id,
+                   labels(inv) AS node_types,
+                   funded_companies,
+                   size(funded_companies) AS overlap_count
+            ORDER BY overlap_count DESC, investor
         """,
     },
 }
@@ -528,6 +545,37 @@ def find_investor_by_id(
         )
 
     return _safe("find_investor_by_id", _run)
+
+
+@mcp.tool()
+def find_investors_for_companies(
+    company_names: list[str],
+    min_overlap: int = 2,
+    agent_session_id: str | None = None,
+) -> str:
+    """Identify investors who funded multiple of the supplied companies.
+
+    Routing: Investor Research Agent. Input: company_names (List[String]),
+    min_overlap (Int, default 2 — minimum number of listed companies an
+    investor must have funded to be considered "overlapping").
+    """
+    tmpl = QUERY_TEMPLATES["find_investors_for_companies"]
+    overlap = max(1, int(min_overlap))
+
+    def _run() -> str:
+        records = execute_read(
+            "find_investors_for_companies",
+            tmpl["query"],
+            {"company_names": company_names, "min_overlap": overlap},
+            agent_session_id,
+        )
+        return _format_records(
+            records,
+            "No overlapping investors found across the supplied companies. "
+            "Verify the company name spellings or lower the overlap threshold.",
+        )
+
+    return _safe("find_investors_for_companies", _run)
 
 
 # --------------------------------------------------------------------------- #
