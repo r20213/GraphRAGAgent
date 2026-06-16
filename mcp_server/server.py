@@ -79,6 +79,12 @@ SCHEMA_SAMPLE_LIMIT = int(os.getenv("SCHEMA_SAMPLE_LIMIT", "1000"))
 MAX_POOL_SIZE = int(os.getenv("NEO4J_MAX_POOL_SIZE", "50"))
 CONNECTION_TIMEOUT = float(os.getenv("NEO4J_CONNECTION_TIMEOUT", "30"))
 
+# Transport: "stdio" for local desktop clients, "streamable-http" (or "sse")
+# for networked/production deployment behind a URL (served by uvicorn).
+MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http").strip().lower()
+MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
+MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
+
 SCHEMA_DOC_PATH = _REPO_ROOT / "utils" / "neo4j_schema.md"
 
 # --------------------------------------------------------------------------- #
@@ -270,6 +276,8 @@ def _format_records(records: list[dict[str, Any]], empty_hint: str) -> str:
 # --------------------------------------------------------------------------- #
 mcp = FastMCP(
     "neo4j-companies",
+    host=MCP_HOST,
+    port=MCP_PORT,
     instructions=(
         "Read-only MCP server for the Neo4j `companies` graph. Prefer the "
         "declarative tools (get_industries, get_companies_in_industry, "
@@ -604,7 +612,13 @@ def run_cypher_query(
 # Entry point
 # --------------------------------------------------------------------------- #
 def main() -> None:
-    """Start the MCP server over stdio after verifying connectivity."""
+    """Start the MCP server after verifying Neo4j connectivity.
+
+    Transport is selected via ``MCP_TRANSPORT``:
+    ``streamable-http`` (default, production — served by uvicorn on
+    ``MCP_HOST``:``MCP_PORT``), ``sse`` (legacy HTTP), or ``stdio`` (local
+    desktop clients).
+    """
     try:
         get_driver()  # fail fast before accepting MCP traffic
     except Exception:  # noqa: BLE001
@@ -612,14 +626,28 @@ def main() -> None:
         close_driver()
         sys.exit(1)
 
-    logger.info(
-        "Starting Neo4j MCP server (read_only=%s, timeout=%ss, cap=%s).",
-        READ_ONLY,
-        QUERY_TIMEOUT,
-        MAX_RESULT_RECORDS,
-    )
+    if MCP_TRANSPORT == "stdio":
+        logger.info(
+            "Starting Neo4j MCP server over stdio "
+            "(read_only=%s, timeout=%ss, cap=%s).",
+            READ_ONLY,
+            QUERY_TIMEOUT,
+            MAX_RESULT_RECORDS,
+        )
+    else:
+        logger.info(
+            "Starting Neo4j MCP server over %s on %s:%s "
+            "(read_only=%s, timeout=%ss, cap=%s).",
+            MCP_TRANSPORT,
+            MCP_HOST,
+            MCP_PORT,
+            READ_ONLY,
+            QUERY_TIMEOUT,
+            MAX_RESULT_RECORDS,
+        )
+
     try:
-        mcp.run()
+        mcp.run(transport=MCP_TRANSPORT)
     finally:
         close_driver()
 
