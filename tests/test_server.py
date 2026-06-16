@@ -201,6 +201,7 @@ EXPECTED_TEMPLATES = {
     "get_people_in_organizations",
     "find_investor_by_name",
     "find_investor_by_id",
+    "find_investors_for_companies",
 }
 
 
