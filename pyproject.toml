@@ -1,0 +1,31 @@
+[tool.ruff]
+# Match the project's existing wrapping (PEP 8 / black-compatible 79 cols).
+line-length = 79
+target-version = "py310"
+
+[tool.ruff.lint]
+# A pragmatic, production-friendly rule set.
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort (import ordering)
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line-too-long is handled by the formatter, not the linter
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Lazy PEP 562 re-export shims: the TYPE_CHECKING block intentionally
+# "imports" symbols only for static type-checkers, and __init__ aggregates
+# the public API — so unused-import / redundant-alias rules don't apply.
+"**/__init__.py" = [
+    "F401",  # imported but unused (re-exported on purpose)
+    "F403",  # star imports (public API aggregation)
+    "PLC0414",  # import alias does not rename (explicit re-export form)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["mcp_server", "utils"]
