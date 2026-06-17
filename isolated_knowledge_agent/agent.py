@@ -81,6 +81,7 @@ class AgentConfig:
     milvus_id_field: str
     milvus_text_field: str
     degree_limit: int
+    require_semantic_context: bool
     llm_model: str
 
     @classmethod
@@ -108,6 +109,10 @@ class AgentConfig:
             milvus_id_field=os.environ.get("MILVUS_ID_FIELD", "id"),
             milvus_text_field=os.environ.get("MILVUS_TEXT_FIELD", "text"),
             degree_limit=int(os.environ.get("GRAPH_HUB_DEGREE_LIMIT", "300")),
+            require_semantic_context=(
+                os.environ.get("REQUIRE_SEMANTIC_CONTEXT", "true").strip().lower()
+                in {"1", "true", "yes", "on"}
+            ),
             llm_model=os.environ.get("LLM_MODEL", "gemini-2.0-flash"),
         )
 
@@ -184,9 +189,31 @@ class KnowledgeAgent:
                     state.tool_status[phase] = "ok"
 
                 elif phase == "semantic_retrieve":
-                    chunks = self._semantic_retrieve(anchor_ids)
+                    chunks, semantic_error = self._semantic_retrieve(anchor_ids)
                     state.semantic_chunk_count = len(chunks)
-                    state.tool_status[phase] = "ok"
+                    if semantic_error:
+                        state.tool_status[phase] = semantic_error
+                        state.errors.append(f"{phase}: {semantic_error}")
+                        if self.config.require_semantic_context:
+                            state.completed_at = time.time()
+                            metrics = {
+                                "run_id": state.run_id,
+                                "steps_taken": state.steps_taken,
+                                "tool_status": state.tool_status,
+                                "errors": state.errors,
+                                "triples_count": state.triples_count,
+                                "anchor_count": state.anchor_count,
+                                "semantic_chunk_count": state.semantic_chunk_count,
+                                "duration_ms": state.duration_ms,
+                                "extracted_entities": entities,
+                                "selected_entity": target_entity or None,
+                            }
+                            return AgentResponse(
+                                answer="No results found.",
+                                metrics=metrics,
+                            )
+                    else:
+                        state.tool_status[phase] = "ok"
 
                 elif phase == "context_synthesis":
                     grounded_context = self._build_grounded_context(
@@ -266,10 +293,10 @@ class KnowledgeAgent:
                 rows.append(row)
         return rows
 
-    def _semantic_retrieve(self, anchor_ids: list[str]) -> list[str]:
+    def _semantic_retrieve(self, anchor_ids: list[str]) -> tuple[list[str], str | None]:
         """Retrieve semantic chunks using scalar expression id containment."""
         if not anchor_ids:
-            return []
+            return [], None
 
         expr = self._build_id_expression(anchor_ids)
         try:
@@ -284,16 +311,23 @@ class KnowledgeAgent:
             )
         except MilvusException as exc:
             LOGGER.warning("Milvus query network/cluster issue: %s", exc)
-            return []
+            if self._is_collection_missing_error(exc):
+                return [], "milvus-collection-not-found"
+            return [], "milvus-query-failed"
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Milvus query unexpected issue: %s", exc)
-            return []
+            return [], "milvus-query-failed"
 
         chunks: list[str] = []
         for row in result:
             if self.config.milvus_text_field in row and row[self.config.milvus_text_field]:
                 chunks.append(str(row[self.config.milvus_text_field]))
-        return chunks
+        return chunks, None
+
+    @staticmethod
+    def _is_collection_missing_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "collection not found" in message
 
     def _reason(self, user_query: str, grounded_context: str) -> str:
         """Use Gemini as deterministic final reasoning engine."""

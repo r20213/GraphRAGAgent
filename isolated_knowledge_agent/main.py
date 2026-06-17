@@ -28,6 +28,7 @@ def main() -> None:
     load_dotenv(local_env)
     load_dotenv()
     logging.basicConfig(level=logging.INFO)
+    logging.getLogger("google_genai.models").setLevel(logging.WARNING)
 
     args = build_parser().parse_args()
     agent = KnowledgeAgent()
