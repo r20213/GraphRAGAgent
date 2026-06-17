@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -35,7 +36,8 @@ RETURN DISTINCT
   coalesce(head(labels(target_node)), 'Unknown') AS target_label,
   coalesce(target_node.name, '<unnamed>') AS target_name,
   coalesce(toString(tgt.anchor_id), toString(tgt.id), toString(elementId(tgt))) AS anchor_id
-ORDER BY source_name, relationship_type, target_name
+ORDER BY relationship_type, source_name, target_name
+LIMIT $candidate_limit
 """
 
 
@@ -81,6 +83,9 @@ class AgentConfig:
     milvus_id_field: str
     milvus_text_field: str
     degree_limit: int
+    result_limit: int
+    candidate_limit: int
+    per_rel_limit: int
     require_semantic_context: bool
     llm_model: str
 
@@ -109,6 +114,11 @@ class AgentConfig:
             milvus_id_field=os.environ.get("MILVUS_ID_FIELD", "id"),
             milvus_text_field=os.environ.get("MILVUS_TEXT_FIELD", "text"),
             degree_limit=int(os.environ.get("GRAPH_HUB_DEGREE_LIMIT", "300")),
+            result_limit=int(os.environ.get("GRAPH_RESULT_LIMIT", "200")),
+            candidate_limit=int(
+                os.environ.get("GRAPH_CANDIDATE_LIMIT", "2000")
+            ),
+            per_rel_limit=int(os.environ.get("GRAPH_PER_REL_LIMIT", "25")),
             require_semantic_context=(
                 os.environ.get("REQUIRE_SEMANTIC_CONTEXT", "true").strip().lower()
                 in {"1", "true", "yes", "on"}
@@ -158,7 +168,7 @@ class KnowledgeAgent:
             state.steps_taken.append(phase)
             try:
                 if phase == "entity_extract":
-                    entities = self._extract_entities_from_query(user_query)
+                    entities = self._extract_entities(user_query)
                     if not entities:
                         state.tool_status[phase] = "no-entity"
                         state.completed_at = time.time()
@@ -279,6 +289,7 @@ class KnowledgeAgent:
                 SCHEMA_AGNOSTIC_QUERY,
                 pattern=pattern,
                 degree_limit=self.config.degree_limit,
+                candidate_limit=self.config.candidate_limit,
             )
             for record in result:
                 row = {
@@ -291,7 +302,47 @@ class KnowledgeAgent:
                 }
                 row["triple"] = self._format_triple(row)
                 rows.append(row)
-        return rows
+        return self._diversify_triples(rows)
+
+    def _diversify_triples(
+        self, rows: list[dict[str, str]]
+    ) -> list[dict[str, str]]:
+        """Select a breadth-first slice covering many relationship types.
+
+        Groups candidate triples by relationship type and fills the final
+        budget by cycling across groups (round-robin), capping how many
+        triples any single relationship type may contribute. This favors
+        coverage of distinct relationships over alphabetical truncation.
+        """
+        if len(rows) <= self.config.result_limit:
+            return rows
+
+        buckets: dict[str, list[dict[str, str]]] = {}
+        order: list[str] = []
+        for row in rows:
+            rel = row["relationship_type"]
+            if rel not in buckets:
+                buckets[rel] = []
+                order.append(rel)
+            buckets[rel].append(row)
+
+        selected: list[dict[str, str]] = []
+        cursors = {rel: 0 for rel in order}
+        per_rel_limit = max(1, self.config.per_rel_limit)
+        while len(selected) < self.config.result_limit:
+            progressed = False
+            for rel in order:
+                cursor = cursors[rel]
+                if cursor >= len(buckets[rel]) or cursor >= per_rel_limit:
+                    continue
+                selected.append(buckets[rel][cursor])
+                cursors[rel] = cursor + 1
+                progressed = True
+                if len(selected) >= self.config.result_limit:
+                    break
+            if not progressed:
+                break
+        return selected
 
     def _semantic_retrieve(self, anchor_ids: list[str]) -> tuple[list[str], str | None]:
         """Retrieve semantic chunks using scalar expression id containment."""
@@ -389,8 +440,59 @@ class KnowledgeAgent:
         escaped = re.escape(target_entity.strip())
         return rf"(?i).*{escaped}.*"
 
+    def _extract_entities(self, user_query: str) -> list[str]:
+        """Extract named entities from the query (LLM first, regex fallback)."""
+        entities = self._extract_entities_llm(user_query)
+        if entities:
+            return entities
+        return self._extract_entities_regex(user_query)
+
+    def _extract_entities_llm(self, user_query: str) -> list[str]:
+        """Use Gemini to pull concrete named entities from the query."""
+        try:
+            response = self._llm.models.generate_content(
+                model=self.config.llm_model,
+                contents=(
+                    "Extract the concrete named entities (companies, people, "
+                    "products, organizations, places) from the question below. "
+                    "Return ONLY a JSON array of strings, most important first. "
+                    "Ignore generic words like 'competitors', 'main', 'who'. "
+                    "If there are none, return [].\n\n"
+                    f"Question: {user_query}"
+                ),
+                config=types.GenerateContentConfig(
+                    temperature=0,
+                    response_mime_type="application/json",
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("LLM entity extraction failed: %s", exc)
+            return []
+
+        raw = (response.text or "").strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            LOGGER.warning("LLM entity extraction returned non-JSON: %s", raw)
+            return []
+
+        entities: list[str] = []
+        seen: set[str] = set()
+        for item in parsed if isinstance(parsed, list) else []:
+            token = str(item).strip()
+            if not token:
+                continue
+            key = token.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            entities.append(token)
+        return entities
+
     @staticmethod
-    def _extract_entities_from_query(user_query: str) -> list[str]:
+    def _extract_entities_regex(user_query: str) -> list[str]:
         candidates: list[str] = []
 
         # Highest-confidence path: quoted entities.
@@ -400,7 +502,7 @@ class KnowledgeAgent:
         candidates.extend(
             re.findall(
                 r"\b(?:of|for|about|regarding|on|at|in)\s+"
-                r"([A-Z][\w&.-]*(?:\s+[A-Z0-9][\w&.-]*){0,4})",
+                r"([A-Za-z][\w&.-]*(?:\s+[A-Za-z0-9][\w&.-]*){0,4})",
                 user_query,
             )
         )
@@ -414,21 +516,23 @@ class KnowledgeAgent:
         )
 
         stopwords = {
-            "Who",
-            "What",
-            "When",
-            "Where",
-            "Why",
-            "How",
-            "Which",
-            "Whose",
-            "Main",
-            "Top",
-            "Give",
-            "Show",
-            "List",
-            "Find",
-            "Tell",
+            "who",
+            "what",
+            "when",
+            "where",
+            "why",
+            "how",
+            "which",
+            "whose",
+            "main",
+            "top",
+            "give",
+            "show",
+            "list",
+            "find",
+            "tell",
+            "competitor",
+            "competitors",
         }
 
         entities: list[str] = []
@@ -437,7 +541,7 @@ class KnowledgeAgent:
             token = item.strip(" ?!.,;:\"'()[]{}")
             if not token:
                 continue
-            if token in stopwords:
+            if token.casefold() in stopwords:
                 continue
             key = token.casefold()
             if key in seen:

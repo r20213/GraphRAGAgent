@@ -29,6 +29,7 @@ def main() -> None:
     load_dotenv()
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("google_genai.models").setLevel(logging.WARNING)
+    logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
 
     args = build_parser().parse_args()
     agent = KnowledgeAgent()
