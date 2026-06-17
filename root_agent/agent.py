@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from google.adk import Agent
 
-from .config import AGENT_MODEL, APP_NAME
+from .config import AGENT_MODEL
 from .memory import RootMemoryStore
 from .routing import classify_query, render_markdown, should_save_memory
 from .specialists import invoke_specialist
@@ -48,12 +48,9 @@ async def get_lessons_learned(
     lines = ["Relevant lessons learned:"]
     for lesson in lessons:
         lines.append(
-            "- route={route} intent={intent} similarity={similarity:.3f} :: {text}".format(
-                route=lesson.route,
-                intent=lesson.intent,
-                similarity=lesson.similarity,
-                text=lesson.assistant_text[:240].strip(),
-            )
+            f"- route={lesson.route} intent={lesson.intent} "
+            f"similarity={lesson.similarity:.3f} :: "
+            f"{lesson.assistant_text[:240].strip()}"
         )
     return "\n".join(lines)
 
