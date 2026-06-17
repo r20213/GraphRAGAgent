@@ -45,26 +45,33 @@ Final hard cap used by this script:
 from __future__ import annotations
 
 import math
+import os
 import random
 import sys
 from collections import Counter, deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
 
+from dotenv import load_dotenv
 from neo4j import GraphDatabase
 from neo4j.exceptions import Neo4jError
 
+# Load credentials from migration_tools/.env (same directory as this file)
+_ENV_PATH = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=_ENV_PATH, override=True)
+
 
 # -----------------------------------------------------------------------------
-# Hardcoded credentials (edit these directly for plug-and-play usage)
+# Credentials — set these in migration_tools/.env, never hard-code here
 # -----------------------------------------------------------------------------
-SOURCE_URI = "neo4j+s://demo.neo4jlabs.com"
-SOURCE_USER = "companies"
-SOURCE_PASSWORD = "companies"
+SOURCE_URI = os.environ["SOURCE_NEO4J_URI"]
+SOURCE_USER = os.environ["SOURCE_NEO4J_USER"]
+SOURCE_PASSWORD = os.environ["SOURCE_NEO4J_PASSWORD"]
 
-TARGET_URI = "neo4j+s://3eab12e0.databases.neo4j.io"
-TARGET_USER = "3eab12e0"
-TARGET_PASSWORD = "bLhKxOk_SaubBSgbDiMO6mINSL71zskJlkILx4tmyPI"
+TARGET_URI = os.environ["TARGET_NEO4J_URI"]
+TARGET_USER = os.environ["TARGET_NEO4J_USER"]
+TARGET_PASSWORD = os.environ["TARGET_NEO4J_PASSWORD"]
 
 
 # -----------------------------------------------------------------------------
@@ -235,7 +242,7 @@ def fetch_balanced_article_seeds(source_driver, article_seed_target: int) -> Lis
 def fetch_organization_seeds(source_driver, org_seed_target: int) -> List[int]:
     q = """
     MATCH (o:Organization)
-    WITH o, size((o)--()) AS degree
+    WITH o, COUNT { (o)--() } AS degree
     ORDER BY degree DESC, id(o)
     LIMIT $lim
     RETURN collect(id(o)) AS ids
