@@ -157,17 +157,32 @@ def print_phase_1_summary() -> None:
 
 
 def create_target_constraints(target_driver) -> None:
+    drop_queries = [
+        "DROP CONSTRAINT org_name_unique IF EXISTS",
+        "DROP CONSTRAINT person_name_unique IF EXISTS",
+        "DROP CONSTRAINT city_name_unique IF EXISTS",
+        "DROP CONSTRAINT country_name_unique IF EXISTS",
+        "DROP CONSTRAINT industry_name_unique IF EXISTS",
+    ]
+
     queries = [
         "CREATE CONSTRAINT migrated_src_id IF NOT EXISTS FOR (n:Migrated) REQUIRE n._src_id IS UNIQUE",
         "CREATE CONSTRAINT article_id_unique IF NOT EXISTS FOR (n:Article) REQUIRE n.id IS UNIQUE",
         "CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS FOR (n:Chunk) REQUIRE n.id IS UNIQUE",
-        "CREATE CONSTRAINT org_name_unique IF NOT EXISTS FOR (n:Organization) REQUIRE n.name IS UNIQUE",
-        "CREATE CONSTRAINT person_name_unique IF NOT EXISTS FOR (n:Person) REQUIRE n.name IS UNIQUE",
-        "CREATE CONSTRAINT city_name_unique IF NOT EXISTS FOR (n:City) REQUIRE n.name IS UNIQUE",
-        "CREATE CONSTRAINT country_name_unique IF NOT EXISTS FOR (n:Country) REQUIRE n.name IS UNIQUE",
-        "CREATE CONSTRAINT industry_name_unique IF NOT EXISTS FOR (n:IndustryCategory) REQUIRE n.name IS UNIQUE",
+        "CREATE INDEX org_name_idx IF NOT EXISTS FOR (n:Organization) ON (n.name)",
+        "CREATE INDEX person_name_idx IF NOT EXISTS FOR (n:Person) ON (n.name)",
+        "CREATE INDEX city_name_idx IF NOT EXISTS FOR (n:City) ON (n.name)",
+        "CREATE INDEX country_name_idx IF NOT EXISTS FOR (n:Country) ON (n.name)",
+        "CREATE INDEX industry_name_idx IF NOT EXISTS FOR (n:IndustryCategory) ON (n.name)",
     ]
     with target_driver.session() as session:
+        for q in drop_queries:
+            try:
+                session.run(q).consume()
+                print(f"Constraint drop check OK: {q}")
+            except Neo4jError as exc:
+                print(f"Constraint drop warning (continuing): {exc}")
+
         for q in queries:
             try:
                 session.run(q).consume()
