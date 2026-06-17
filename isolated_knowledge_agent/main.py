@@ -15,7 +15,6 @@ from .agent import KnowledgeAgent
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the standalone Knowledge Agent.")
     parser.add_argument("--query", help="Natural language question.")
-    parser.add_argument("--entity", help="Target entity text.")
     parser.add_argument(
         "--repl",
         action="store_true",
@@ -38,10 +37,10 @@ def main() -> None:
             _run_repl(agent)
             return
 
-        if not args.query or not args.entity:
-            raise SystemExit("For one-shot mode, pass both --query and --entity.")
+        if not args.query:
+            raise SystemExit("For one-shot mode, pass --query.")
 
-        result = agent.run(user_query=args.query, target_entity=args.entity)
+        result = agent.run(user_query=args.query)
         print(_as_json(result.answer, result.metrics))
     finally:
         agent.close()
@@ -63,14 +62,7 @@ def _run_repl(agent: KnowledgeAgent) -> None:
         if not query:
             continue
 
-        entity = input("entity> ").strip()
-        if entity.lower() in {"exit", "quit"}:
-            break
-        if not entity:
-            print("Entity is required for each question.\n")
-            continue
-
-        result = agent.run(user_query=query, target_entity=entity)
+        result = agent.run(user_query=query)
         print()
         print("agent>", result.answer)
         print(_as_json(result.answer, result.metrics))

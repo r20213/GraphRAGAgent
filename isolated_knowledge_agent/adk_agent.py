@@ -17,19 +17,18 @@ You are the ADK interface for the autonomous KnowledgeAgent.
 
 For each request:
 1. Extract the natural-language user query.
-2. Extract a target entity string.
-3. Call the tool `run_knowledge_agent` exactly once.
-4. Return the tool result as the final output.
+2. Call the tool `run_knowledge_agent` exactly once.
+3. Return the tool result as the final output.
 
 Do not invent facts outside the tool output.
 """
 
 
-def run_knowledge_agent(user_query: str, target_entity: str) -> str:
+def run_knowledge_agent(user_query: str) -> str:
     """Execute the standalone KnowledgeAgent and return JSON output."""
     agent = KnowledgeAgent()
     try:
-        result = agent.run(user_query=user_query, target_entity=target_entity)
+        result = agent.run(user_query=user_query)
         return json.dumps(
             {
                 "answer": result.answer,

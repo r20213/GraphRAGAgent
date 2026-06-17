@@ -128,7 +128,7 @@ class KnowledgeAgent:
         """Release driver resources."""
         self._neo4j_driver.close()
 
-    def run(self, user_query: str, target_entity: str) -> AgentResponse:
+    def run(self, user_query: str) -> AgentResponse:
         """Execute the autonomous multi-step tool loop and return final payload."""
         state = ExecutionState(
             run_id=str(int(time.time() * 1000)),
@@ -137,8 +137,13 @@ class KnowledgeAgent:
 
         triples: list[dict[str, str]] = []
         chunks: list[str] = []
+        anchor_ids: list[str] = []
+        entities: list[str] = []
+        target_entity = ""
+        answer = "No results found."
 
         for phase in (
+            "entity_extract",
             "graph_slice",
             "anchor_collect",
             "semantic_retrieve",
@@ -147,7 +152,28 @@ class KnowledgeAgent:
         ):
             state.steps_taken.append(phase)
             try:
-                if phase == "graph_slice":
+                if phase == "entity_extract":
+                    entities = self._extract_entities_from_query(user_query)
+                    if not entities:
+                        state.tool_status[phase] = "no-entity"
+                        state.completed_at = time.time()
+                        metrics = {
+                            "run_id": state.run_id,
+                            "steps_taken": state.steps_taken,
+                            "tool_status": state.tool_status,
+                            "errors": state.errors,
+                            "triples_count": state.triples_count,
+                            "anchor_count": state.anchor_count,
+                            "semantic_chunk_count": state.semantic_chunk_count,
+                            "duration_ms": state.duration_ms,
+                            "extracted_entities": entities,
+                            "selected_entity": None,
+                        }
+                        return AgentResponse(answer="No results found.", metrics=metrics)
+                    target_entity = entities[0]
+                    state.tool_status[phase] = "ok"
+
+                elif phase == "graph_slice":
                     triples = self._graph_slice(target_entity)
                     state.triples_count = len(triples)
                     state.tool_status[phase] = "ok"
@@ -195,6 +221,8 @@ class KnowledgeAgent:
             "anchor_count": state.anchor_count,
             "semantic_chunk_count": state.semantic_chunk_count,
             "duration_ms": state.duration_ms,
+            "extracted_entities": entities,
+            "selected_entity": target_entity or None,
         }
         return AgentResponse(answer=answer, metrics=metrics)
 
@@ -326,6 +354,63 @@ class KnowledgeAgent:
     def _build_entity_pattern(target_entity: str) -> str:
         escaped = re.escape(target_entity.strip())
         return rf"(?i).*{escaped}.*"
+
+    @staticmethod
+    def _extract_entities_from_query(user_query: str) -> list[str]:
+        candidates: list[str] = []
+
+        # Highest-confidence path: quoted entities.
+        candidates.extend(re.findall(r"['\"]([^'\"]{2,80})['\"]", user_query))
+
+        # Capture entities after intent prepositions (e.g., "competitors of YouTube").
+        candidates.extend(
+            re.findall(
+                r"\b(?:of|for|about|regarding|on|at|in)\s+"
+                r"([A-Z][\w&.-]*(?:\s+[A-Z0-9][\w&.-]*){0,4})",
+                user_query,
+            )
+        )
+
+        # General title-case and acronym entities.
+        candidates.extend(
+            re.findall(
+                r"\b([A-Z][\w&.-]*(?:\s+[A-Z0-9][\w&.-]*){0,4}|[A-Z]{2,})\b",
+                user_query,
+            )
+        )
+
+        stopwords = {
+            "Who",
+            "What",
+            "When",
+            "Where",
+            "Why",
+            "How",
+            "Which",
+            "Whose",
+            "Main",
+            "Top",
+            "Give",
+            "Show",
+            "List",
+            "Find",
+            "Tell",
+        }
+
+        entities: list[str] = []
+        seen: set[str] = set()
+        for item in candidates:
+            token = item.strip(" ?!.,;:\"'()[]{}")
+            if not token:
+                continue
+            if token in stopwords:
+                continue
+            key = token.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            entities.append(token)
+        return entities
 
     def _build_id_expression(self, anchor_ids: list[str]) -> str:
         quoted = [self._quote_literal(anchor_id) for anchor_id in anchor_ids]
