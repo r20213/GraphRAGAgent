@@ -29,4 +29,11 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["mcp_server", "utils"]
+known-first-party = [
+    "graph_db_agent",
+    "investment_agent",
+    "investor_agent",
+    "mcp_server",
+    "root_agent",
+    "utils",
+]

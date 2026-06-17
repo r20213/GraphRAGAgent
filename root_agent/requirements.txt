@@ -1,0 +1,18 @@
+# Root Agent orchestrator runtime dependencies.
+
+# --- Google ADK + Gemini + A2A protocol ---
+google-adk>=1.0.0
+google-genai>=1.0.0
+a2a-sdk>=0.2.0
+uvicorn[standard]>=0.30.0
+
+# --- Shared graph / MCP stack used by local specialist fallbacks ---
+neo4j>=5.20.0
+mcp[cli]>=1.2.0
+python-dotenv>=1.0.0
+
+# --- Orchestrator memory and ingestion ---
+redis>=5.0.0
+psycopg[binary]>=3.2.0
+pgvector>=0.3.6
+httpx>=0.27.0
