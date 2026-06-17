@@ -158,6 +158,8 @@ def print_phase_1_summary() -> None:
 
 def create_target_constraints(target_driver) -> None:
     drop_queries = [
+        "DROP CONSTRAINT article_id_unique IF EXISTS",
+        "DROP CONSTRAINT chunk_id_unique IF EXISTS",
         "DROP CONSTRAINT org_name_unique IF EXISTS",
         "DROP CONSTRAINT person_name_unique IF EXISTS",
         "DROP CONSTRAINT city_name_unique IF EXISTS",
@@ -167,8 +169,8 @@ def create_target_constraints(target_driver) -> None:
 
     queries = [
         "CREATE CONSTRAINT migrated_src_id IF NOT EXISTS FOR (n:Migrated) REQUIRE n._src_id IS UNIQUE",
-        "CREATE CONSTRAINT article_id_unique IF NOT EXISTS FOR (n:Article) REQUIRE n.id IS UNIQUE",
-        "CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS FOR (n:Chunk) REQUIRE n.id IS UNIQUE",
+        "CREATE INDEX article_id_idx IF NOT EXISTS FOR (n:Article) ON (n.id)",
+        "CREATE INDEX chunk_id_idx IF NOT EXISTS FOR (n:Chunk) ON (n.id)",
         "CREATE INDEX org_name_idx IF NOT EXISTS FOR (n:Organization) ON (n.name)",
         "CREATE INDEX person_name_idx IF NOT EXISTS FOR (n:Person) ON (n.name)",
         "CREATE INDEX city_name_idx IF NOT EXISTS FOR (n:City) ON (n.name)",
