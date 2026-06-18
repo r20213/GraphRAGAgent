@@ -73,6 +73,10 @@ TARGET_URI = os.environ["TARGET_NEO4J_URI"]
 TARGET_USER = os.environ["TARGET_NEO4J_USER"]
 TARGET_PASSWORD = os.environ["TARGET_NEO4J_PASSWORD"]
 
+# The node-budget math assumes an EMPTY target. Set RESET_TARGET=true in the
+# environment to allow this script to wipe the target before migrating.
+RESET_TARGET = os.environ.get("RESET_TARGET", "false").strip().lower() in ("1", "true", "yes")
+
 
 # -----------------------------------------------------------------------------
 # Safety and migration ceilings
@@ -93,6 +97,10 @@ LEGACY_VECTOR_KEYS = {
     "embedding_google_004",
     "embedding_sbert",
 }
+
+# Transient label used only to key MERGE/MATCH during migration. It is stripped
+# from every node once writes complete, so it never appears in the final schema.
+MIGRATION_LABEL = "_MigrationNode"
 
 
 # -----------------------------------------------------------------------------
@@ -128,8 +136,17 @@ def chunks(seq: Sequence[int], size: int) -> Iterable[List[int]]:
 
 
 def sanitize_properties(props: Dict[str, Any]) -> Dict[str, Any]:
-    cleaned = {k: v for k, v in props.items() if k not in LEGACY_VECTOR_KEYS}
+    cleaned: Dict[str, Any] = {}
+    for k, v in props.items():
+        if k in LEGACY_VECTOR_KEYS:
+            continue
+        # Drop NaN numerics (e.g. a.sentiment) rather than carrying them over;
+        # NaN breaks ordering/comparison in Cypher.
+        if isinstance(v, float) and math.isnan(v):
+            continue
+        cleaned[k] = v
     cleaned.pop("_src_id", None)
+    cleaned.pop("_src_rid", None)
     return cleaned
 
 
@@ -158,6 +175,7 @@ def print_phase_1_summary() -> None:
 
 def create_target_constraints(target_driver) -> None:
     drop_queries = [
+        "DROP CONSTRAINT migrated_src_id IF EXISTS",
         "DROP CONSTRAINT article_id_unique IF EXISTS",
         "DROP CONSTRAINT chunk_id_unique IF EXISTS",
         "DROP CONSTRAINT org_name_unique IF EXISTS",
@@ -168,7 +186,8 @@ def create_target_constraints(target_driver) -> None:
     ]
 
     queries = [
-        "CREATE CONSTRAINT migrated_src_id IF NOT EXISTS FOR (n:Migrated) REQUIRE n._src_id IS UNIQUE",
+        f"CREATE CONSTRAINT migration_node_src_id IF NOT EXISTS "
+        f"FOR (n:{escape_label_or_type(MIGRATION_LABEL)}) REQUIRE n._src_id IS UNIQUE",
         "CREATE INDEX article_id_idx IF NOT EXISTS FOR (n:Article) ON (n.id)",
         "CREATE INDEX chunk_id_idx IF NOT EXISTS FOR (n:Chunk) ON (n.id)",
         "CREATE INDEX org_name_idx IF NOT EXISTS FOR (n:Organization) ON (n.name)",
@@ -191,6 +210,60 @@ def create_target_constraints(target_driver) -> None:
                 print(f"Constraint OK: {q}")
             except Neo4jError as exc:
                 print(f"Constraint warning (continuing): {exc}")
+
+
+def ensure_target_capacity(target_driver) -> None:
+    """Guarantee the node-budget math is honored by starting from an empty target.
+
+    The Phase 1 cap (MAX_TOTAL_NODES) only holds if the target begins empty.
+    Pre-existing nodes silently push the live total over the cap, which is the
+    root cause of the observed 111,817 > 100,000 overshoot.
+    """
+    with target_driver.session() as session:
+        rec = session.run("MATCH (n) RETURN count(n) AS c").single()
+    existing = rec["c"] if rec else 0
+
+    if existing == 0:
+        print("Target is empty. Node-budget math will hold.")
+        return
+
+    if not RESET_TARGET:
+        raise RuntimeError(
+            f"Target already contains {existing:,} nodes. The node cap "
+            f"({MAX_TOTAL_NODES:,}) assumes an empty target, so migrating now would "
+            f"overshoot it. Set RESET_TARGET=true to wipe the target, or clear it manually."
+        )
+
+    print(f"RESET_TARGET set; wiping {existing:,} existing nodes from target...")
+    with target_driver.session() as session:
+        session.run(
+            "MATCH (n) CALL (n) { DETACH DELETE n } IN TRANSACTIONS OF 10000 ROWS"
+        ).consume()
+    print("Target wiped.")
+
+
+def finalize_labels(target_driver) -> None:
+    """Strip the transient migration label so it never pollutes the final schema."""
+    label = escape_label_or_type(MIGRATION_LABEL)
+    print(f"Removing transient :{MIGRATION_LABEL} label from migrated nodes...")
+    with target_driver.session() as session:
+        session.run(
+            f"MATCH (n:{label}) CALL (n) {{ REMOVE n:{label} }} IN TRANSACTIONS OF 10000 ROWS"
+        ).consume()
+        try:
+            session.run("DROP CONSTRAINT migration_node_src_id IF EXISTS").consume()
+        except Neo4jError as exc:
+            print(f"Constraint drop warning (continuing): {exc}")
+    print("Transient label removed; final node labels match the source schema.")
+
+
+def fetch_fewshot_seeds(source_driver) -> List[int]:
+    """Fewshot nodes are a disconnected island (no relationships), so BFS expansion
+    never reaches them. Seed them explicitly to avoid silently dropping them."""
+    q = "MATCH (f:Fewshot) RETURN collect(id(f)) AS ids"
+    with source_driver.session() as session:
+        rec = session.run(q).single()
+    return list(rec["ids"]) if rec and rec["ids"] else []
 
 
 def fetch_top_sites(source_driver, limit_sites: int) -> List[str]:
@@ -289,6 +362,7 @@ def grow_cluster_nodes(
     source_driver,
     article_seed_ids: Sequence[int],
     org_seed_ids: Sequence[int],
+    island_seed_ids: Sequence[int] = (),
 ) -> Set[int]:
     selected: Set[int] = set()
     frontier: deque[int] = deque()
@@ -297,7 +371,11 @@ def grow_cluster_nodes(
     article_count = 0
     chunk_count = 0
 
-    seed_ids = list(dict.fromkeys(list(article_seed_ids) + list(org_seed_ids)))
+    seed_ids = list(
+        dict.fromkeys(
+            list(article_seed_ids) + list(org_seed_ids) + list(island_seed_ids)
+        )
+    )
     seed_labels = node_labels_lookup(source_driver, seed_ids)
 
     for nid in seed_ids:
@@ -429,14 +507,53 @@ def fetch_relationships(source_driver, valid_nodes: Set[int]) -> List[Relationsh
                     )
 
     if len(out) > MAX_TOTAL_RELATIONSHIPS:
-        out = out[:MAX_TOTAL_RELATIONSHIPS]
+        out = _select_relationships_within_cap(out, MAX_TOTAL_RELATIONSHIPS)
     return out
+
+
+def _select_relationships_within_cap(
+    rels: List[RelationshipRecord], cap: int
+) -> List[RelationshipRecord]:
+    """Trim to `cap` relationships without wiping out whole relationship types.
+
+    Instead of a blind `rels[:cap]` slice (which is non-deterministic and can drop
+    an entire type), allocate the budget proportionally across types and keep a
+    deterministic, reproducible subset within each type.
+    """
+    by_type: Dict[str, List[RelationshipRecord]] = {}
+    for r in rels:
+        by_type.setdefault(r.rtype, []).append(r)
+
+    for items in by_type.values():
+        items.sort(key=lambda r: r.rid)
+
+    total = len(rels)
+    allocations: Dict[str, int] = {}
+    for rtype, items in by_type.items():
+        share = max(1, math.floor(cap * len(items) / total))
+        allocations[rtype] = min(len(items), share)
+
+    rtypes_cycle = sorted(by_type.keys())
+    chosen = sum(allocations.values())
+    idx = 0
+    guard = len(rtypes_cycle) * 10_000 + total
+    while chosen < cap and idx < guard:
+        rtype = rtypes_cycle[idx % len(rtypes_cycle)]
+        if allocations[rtype] < len(by_type[rtype]):
+            allocations[rtype] += 1
+            chosen += 1
+        idx += 1
+
+    selected: List[RelationshipRecord] = []
+    for rtype in rtypes_cycle:
+        selected.extend(by_type[rtype][: allocations[rtype]])
+    return selected[:cap]
 
 
 def upsert_nodes(target_driver, nodes: List[NodeRecord]) -> None:
     grouped: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {}
     for n in nodes:
-        labels = tuple(sorted(set(n.labels) | {"Migrated"}))
+        labels = tuple(sorted(set(n.labels) | {MIGRATION_LABEL}))
         grouped.setdefault(labels, []).append({"nid": n.nid, "props": n.props})
 
     with target_driver.session() as session:
@@ -466,10 +583,11 @@ def upsert_relationships(target_driver, rels: List[RelationshipRecord]) -> None:
     with target_driver.session() as session:
         for rtype, rows in grouped.items():
             escaped_rtype = escape_label_or_type(rtype)
+            migration_label = escape_label_or_type(MIGRATION_LABEL)
             q = f"""
             UNWIND $rows AS row
-            MATCH (s:Migrated {{_src_id: row.sid}})
-            MATCH (t:Migrated {{_src_id: row.tid}})
+            MATCH (s:{migration_label} {{_src_id: row.sid}})
+            MATCH (t:{migration_label} {{_src_id: row.tid}})
             MERGE (s)-[r:{escaped_rtype} {{_src_rid: row.rid}}]->(t)
             SET r += row.props
             """
@@ -500,6 +618,9 @@ def main() -> int:
         print("Creating target constraints before inserts...")
         create_target_constraints(target_driver)
 
+        print("Verifying target is empty (node-budget precondition)...")
+        ensure_target_capacity(target_driver)
+
         print("Selecting balanced article seeds by sentiment/siteName...")
         article_seed_ids = fetch_balanced_article_seeds(source_driver, ARTICLE_SEED_TARGET)
         print(f"Article seeds selected: {len(article_seed_ids):,}")
@@ -508,8 +629,14 @@ def main() -> int:
         org_seed_ids = fetch_organization_seeds(source_driver, ORG_SEED_TARGET)
         print(f"Organization seeds selected: {len(org_seed_ids):,}")
 
+        print("Selecting Fewshot island seeds...")
+        fewshot_seed_ids = fetch_fewshot_seeds(source_driver)
+        print(f"Fewshot seeds selected: {len(fewshot_seed_ids):,}")
+
         print("Running 3-hop anchor expansion with hard node caps...")
-        selected_node_ids = grow_cluster_nodes(source_driver, article_seed_ids, org_seed_ids)
+        selected_node_ids = grow_cluster_nodes(
+            source_driver, article_seed_ids, org_seed_ids, fewshot_seed_ids
+        )
         print(f"Selected unique nodes: {len(selected_node_ids):,}")
 
         print("Extracting node payloads...")
@@ -528,6 +655,9 @@ def main() -> int:
         print("Writing relationships to target in 2,000-record batches...")
         upsert_relationships(target_driver, rels)
         print("Relationship write complete.")
+
+        print("Stripping transient migration label...")
+        finalize_labels(target_driver)
 
         print("Migration + prune completed successfully.")
         print(f"Final migrated nodes: {len(nodes):,} (cap {MAX_TOTAL_NODES:,})")
