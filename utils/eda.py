@@ -319,9 +319,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     """Build the command-line interface for schema extraction.
 
     Every connection detail can be overridden on the command line so the same
-    tool can introspect any Neo4j graph. When a flag is omitted the value falls
-    back to the corresponding environment variable / default loaded from
-    ``utils/.env``.
+    tool can introspect any Neo4j graph. All flags default to ``None`` here;
+    ``main()`` resolves each one as *CLI value → environment / .env default*,
+    which guarantees that an explicitly passed flag always wins.
     """
     parser = argparse.ArgumentParser(
         prog="eda",
@@ -332,30 +332,33 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--uri",
-        default=DEFAULT_URI,
-        help=f"Neo4j connection URI (default from env: {DEFAULT_URI!r}).",
+        default=None,
+        help=f"Neo4j connection URI. Overrides env (default: {DEFAULT_URI!r}).",
     )
     parser.add_argument(
         "--user",
         "--username",
         dest="user",
-        default=DEFAULT_USER,
-        help=f"Database username (default from env: {DEFAULT_USER!r}).",
+        default=None,
+        help=f"Database username. Overrides env (default: {DEFAULT_USER!r}).",
     )
     parser.add_argument(
         "--password",
-        default=DEFAULT_PASSWORD,
-        help="Database password (default from env). Prompted if set to '-'.",
+        default=None,
+        help="Database password. Overrides env. Prompted if set to '-'.",
     )
     parser.add_argument(
         "--database",
-        default=DEFAULT_DATABASE,
-        help=f"Target database name (default from env: {DEFAULT_DATABASE!r}).",
+        default=None,
+        help=(
+            "Target database name. Overrides env "
+            f"(default: {DEFAULT_DATABASE!r})."
+        ),
     )
     parser.add_argument(
         "--example-count",
         type=int,
-        default=DEFAULT_EXAMPLE_COUNT,
+        default=None,
         help=(
             "Number of example values to collect per property "
             f"(default: {DEFAULT_EXAMPLE_COUNT})."
@@ -364,7 +367,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-o",
         "--output",
-        default="neo4j_schema.md",
+        default=None,
         help=(
             "Path to write the Markdown schema to "
             "(default: neo4j_schema.md). Use '-' to skip writing a file."
@@ -374,23 +377,40 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """CLI entry point: extract a graph schema and write/print the Markdown."""
+    """CLI entry point: extract a graph schema and write/print the Markdown.
+
+    Command-line arguments strictly override any ``.env`` / environment values:
+    a flag is only replaced by its default when it was not supplied at all.
+    """
     args = _build_arg_parser().parse_args(argv)
 
-    password = args.password
+    # Resolve each setting as: CLI value (if provided) -> env/.env default.
+    uri = args.uri if args.uri is not None else DEFAULT_URI
+    user = args.user if args.user is not None else DEFAULT_USER
+    password = args.password if args.password is not None else DEFAULT_PASSWORD
+    database = args.database if args.database is not None else DEFAULT_DATABASE
+    example_count = (
+        args.example_count
+        if args.example_count is not None
+        else DEFAULT_EXAMPLE_COUNT
+    )
+    output_arg = args.output if args.output is not None else "neo4j_schema.md"
+
+    # Securely prompt for the password when requested via '-'.
     if password == "-":
         import getpass
 
-        password = getpass.getpass(f"Password for '{args.user}': ")
+        password = getpass.getpass(f"Password for '{user}': ")
 
-    output_path = None if args.output == "-" else args.output
+    # '-' disables file output; otherwise write to the resolved path.
+    output_path = None if output_arg == "-" else output_arg
 
     schema_md = get_neo4j_schema_markdown(
-        uri=args.uri,
-        username=args.user,
+        uri=uri,
+        username=user,
         password=password,
-        database=args.database,
-        example_count=args.example_count,
+        database=database,
+        example_count=example_count,
         output_path=output_path,
     )
     print(schema_md)
