@@ -308,3 +308,93 @@ def test_get_neo4j_schema_reads_local_markdown(srv):
     out = srv.get_neo4j_schema()
     # The repository ships utils/neo4j_schema.md describing the companies graph.
     assert "Neo4j Graph Schema" in out
+
+
+# --------------------------------------------------------------------------- #
+# Permission-level guardrail: writes must be rejected by the server itself
+# --------------------------------------------------------------------------- #
+class _ProbeTx:
+    """Fake transaction whose run() either raises or returns, tracking rollback."""
+
+    def __init__(self, raise_exc):
+        self._raise = raise_exc
+        self.rolled_back = False
+
+    def run(self, *args, **kwargs):
+        if self._raise is not None:
+            raise self._raise
+        return _ProbeResult()
+
+    def rollback(self):
+        self.rolled_back = True
+
+
+class _ProbeResult:
+    def consume(self):
+        return None
+
+
+class _ProbeSession:
+    def __init__(self, tx):
+        self._tx = tx
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def begin_transaction(self, **kwargs):
+        return self._tx
+
+
+class _ProbeDriver:
+    def __init__(self, raise_exc):
+        self.tx = _ProbeTx(raise_exc)
+
+    def session(self, **kwargs):
+        return _ProbeSession(self.tx)
+
+    def close(self):
+        pass
+
+    def verify_connectivity(self):
+        return True
+
+
+def test_verify_read_only_passes_when_write_rejected(srv, monkeypatch):
+    from neo4j.exceptions import ClientError
+
+    rejected = ClientError("Writing in read access mode not allowed")
+    rejected.code = "Neo.ClientError.Statement.AccessMode"
+    driver = _ProbeDriver(rejected)
+    monkeypatch.setattr(srv, "READ_ONLY", True)
+    monkeypatch.setattr(srv, "get_driver", lambda: driver)
+
+    # Server rejected the probe write -> no exception, and the probe is rolled
+    # back so nothing is persisted.
+    srv.verify_read_only_enforced()
+    assert driver.tx.rolled_back is True
+
+
+def test_verify_read_only_fails_closed_when_write_accepted(srv, monkeypatch):
+    # No exception on run() => the endpoint accepted a write in READ mode.
+    driver = _ProbeDriver(None)
+    monkeypatch.setattr(srv, "READ_ONLY", True)
+    monkeypatch.setattr(srv, "get_driver", lambda: driver)
+
+    with pytest.raises(RuntimeError, match="Read-only guardrail FAILED"):
+        srv.verify_read_only_enforced()
+    # Even on a writable endpoint the probe must never persist anything.
+    assert driver.tx.rolled_back is True
+
+
+def test_verify_read_only_skipped_when_disabled(srv, monkeypatch):
+    def _boom():  # pragma: no cover - must not be called
+        raise AssertionError("get_driver should not be called when disabled")
+
+    monkeypatch.setattr(srv, "READ_ONLY", False)
+    monkeypatch.setattr(srv, "get_driver", _boom)
+
+    # READ_ONLY disabled -> probe is skipped without touching the driver.
+    srv.verify_read_only_enforced()

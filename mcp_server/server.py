@@ -67,7 +67,25 @@ NEO4J_USERNAME = os.getenv("NEO4J_USERNAME", "companies")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "companies")
 NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "companies")
 
+# Optional least-privilege read-only credentials. The original `companies`
+# demo database is writable by no one (the account itself is read-only), but
+# the migrated target (Aura) authenticates with a *writable* account. When a
+# dedicated read-only user is available, set these so the driver authenticates
+# as that user — writes are then blocked at the database RBAC level, the
+# strongest guardrail. They default to the primary credentials when unset.
+NEO4J_READONLY_USERNAME = os.getenv("NEO4J_READONLY_USERNAME", "").strip()
+NEO4J_READONLY_PASSWORD = os.getenv("NEO4J_READONLY_PASSWORD", "")
+
 READ_ONLY = os.getenv("NEO4J_READ_ONLY", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+# When true (default) the server probes the target at startup to *prove* that
+# writes are rejected and refuses to start otherwise (fail-closed). This is a
+# server/permission-level guardrail independent of the syntactic write check.
+VERIFY_READ_ONLY = os.getenv("NEO4J_VERIFY_READ_ONLY", "true").strip().lower() in {
     "1",
     "true",
     "yes",
@@ -199,10 +217,21 @@ def get_driver():
     """Return the lazily-initialised, process-wide Neo4j driver singleton."""
     global _driver
     if _driver is None:
-        logger.info("Initialising Neo4j driver pool -> %s", NEO4J_URI)
+        # Prefer a dedicated least-privilege read-only user when configured so
+        # writes are blocked at the database RBAC layer, not just by the
+        # transaction access mode and syntactic guards.
+        if NEO4J_READONLY_USERNAME:
+            auth = (NEO4J_READONLY_USERNAME, NEO4J_READONLY_PASSWORD)
+            auth_user = NEO4J_READONLY_USERNAME
+        else:
+            auth = (NEO4J_USERNAME, NEO4J_PASSWORD)
+            auth_user = NEO4J_USERNAME
+        logger.info(
+            "Initialising Neo4j driver pool -> %s (user=%s)", NEO4J_URI, auth_user
+        )
         _driver = GraphDatabase.driver(
             NEO4J_URI,
-            auth=(NEO4J_USERNAME, NEO4J_PASSWORD),
+            auth=auth,
             max_connection_pool_size=MAX_POOL_SIZE,
             connection_timeout=CONNECTION_TIMEOUT,
         )
@@ -756,6 +785,75 @@ def run_cypher_query(
 
 
 # --------------------------------------------------------------------------- #
+# Permission-level guardrail: prove the server rejects writes (fail-closed)
+# --------------------------------------------------------------------------- #
+# A trivial write used purely to confirm the server enforces read-only access.
+# It is executed inside a READ-access transaction that is *always* rolled back,
+# so nothing is ever persisted — even against a misconfigured writable endpoint.
+_READ_ONLY_PROBE = "CREATE (n:`__mcp_readonly_probe__`) RETURN id(n)"
+
+
+def verify_read_only_enforced() -> None:
+    """Confirm the database itself rejects writes; fail closed if it does not.
+
+    Unlike the syntactic :func:`_is_write_query` check, this is a true
+    server/permission-level guardrail. It opens a transaction in READ access
+    mode and attempts a write:
+
+    * A correctly enforced server raises immediately ("Writing in read access
+      mode not allowed", or a privilege error when using a read-only user). The
+      probe transaction is rolled back and startup proceeds.
+    * If the write is *not* rejected, the target is writable through this
+      connection. We roll back (so nothing is persisted) and raise, refusing to
+      start so the LLM-facing tools can never mutate the graph.
+
+    Set ``NEO4J_VERIFY_READ_ONLY=false`` to skip (not recommended for writable
+    targets such as Aura).
+    """
+    if not READ_ONLY:
+        logger.warning(
+            "NEO4J_READ_ONLY is disabled; skipping read-only enforcement probe."
+        )
+        return
+
+    driver = get_driver()
+    with driver.session(
+        database=NEO4J_DATABASE, default_access_mode=READ_ACCESS
+    ) as session:
+        tx = session.begin_transaction(
+            metadata={
+                "app": "neo4j-mcp-server",
+                "mcp_tool_name": "readonly_enforcement_probe",
+            }
+        )
+        try:
+            tx.run(_READ_ONLY_PROBE).consume()
+        except Neo4jError as exc:
+            # Expected path: the server blocked the write.
+            logger.info(
+                "Read-only enforcement verified: server rejected probe write "
+                "(%s).",
+                exc.code or "client error",
+            )
+            return
+        else:
+            raise RuntimeError(
+                "Read-only guardrail FAILED: the target database accepted a "
+                "write while in READ access mode. Refusing to start to prevent "
+                "unintended mutations. Connect with a read-only user "
+                "(NEO4J_READONLY_USERNAME/PASSWORD) or enable access-mode "
+                "enforcement on the server."
+            )
+        finally:
+            # Always roll back — guarantees the probe never persists anything,
+            # including on a writable endpoint where run() did not raise.
+            try:
+                tx.rollback()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
+
+
+# --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
 def main() -> None:
@@ -768,8 +866,13 @@ def main() -> None:
     """
     try:
         get_driver()  # fail fast before accepting MCP traffic
+        if VERIFY_READ_ONLY:
+            # Prove writes are rejected before exposing any tools (fail-closed).
+            verify_read_only_enforced()
     except Exception:  # noqa: BLE001
-        logger.exception("Fatal: could not establish Neo4j connectivity.")
+        logger.exception(
+            "Fatal: could not establish a verified read-only Neo4j connection."
+        )
         close_driver()
         sys.exit(1)
 

@@ -21,6 +21,7 @@ _LAZY_EXPORTS = (
     "get_driver",
     "close_driver",
     "execute_read",
+    "verify_read_only_enforced",
     "get_industries",
     "get_companies_in_industry",
     "get_articles_with_sentiment",
@@ -37,6 +38,7 @@ __all__ = [
     "get_driver",
     "close_driver",
     "execute_read",
+    "verify_read_only_enforced",
     "get_industries",
     "get_companies_in_industry",
     "get_articles_with_sentiment",
@@ -79,5 +81,6 @@ if TYPE_CHECKING:  # Static type-checkers / IDEs resolve the real symbols.
         main as main,
         mcp as mcp,
         run_cypher_query as run_cypher_query,
+        verify_read_only_enforced as verify_read_only_enforced,
     )
 
