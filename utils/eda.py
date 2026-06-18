@@ -8,6 +8,7 @@ clean Markdown suitable for injecting into an LLM prompt.
 
 from __future__ import annotations
 
+import argparse
 import os
 from collections import defaultdict
 from pathlib import Path
@@ -314,6 +315,86 @@ def get_neo4j_schema_markdown(
     return markdown
 
 
-if __name__ == "__main__":
-    schema_md = get_neo4j_schema_markdown(output_path="neo4j_schema.md")
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Build the command-line interface for schema extraction.
+
+    Every connection detail can be overridden on the command line so the same
+    tool can introspect any Neo4j graph. When a flag is omitted the value falls
+    back to the corresponding environment variable / default loaded from
+    ``utils/.env``.
+    """
+    parser = argparse.ArgumentParser(
+        prog="eda",
+        description=(
+            "Extract a Neo4j graph schema as Markdown. Point it at any graph "
+            "by overriding the connection details below."
+        ),
+    )
+    parser.add_argument(
+        "--uri",
+        default=DEFAULT_URI,
+        help=f"Neo4j connection URI (default from env: {DEFAULT_URI!r}).",
+    )
+    parser.add_argument(
+        "--user",
+        "--username",
+        dest="user",
+        default=DEFAULT_USER,
+        help=f"Database username (default from env: {DEFAULT_USER!r}).",
+    )
+    parser.add_argument(
+        "--password",
+        default=DEFAULT_PASSWORD,
+        help="Database password (default from env). Prompted if set to '-'.",
+    )
+    parser.add_argument(
+        "--database",
+        default=DEFAULT_DATABASE,
+        help=f"Target database name (default from env: {DEFAULT_DATABASE!r}).",
+    )
+    parser.add_argument(
+        "--example-count",
+        type=int,
+        default=DEFAULT_EXAMPLE_COUNT,
+        help=(
+            "Number of example values to collect per property "
+            f"(default: {DEFAULT_EXAMPLE_COUNT})."
+        ),
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="neo4j_schema.md",
+        help=(
+            "Path to write the Markdown schema to "
+            "(default: neo4j_schema.md). Use '-' to skip writing a file."
+        ),
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    """CLI entry point: extract a graph schema and write/print the Markdown."""
+    args = _build_arg_parser().parse_args(argv)
+
+    password = args.password
+    if password == "-":
+        import getpass
+
+        password = getpass.getpass(f"Password for '{args.user}': ")
+
+    output_path = None if args.output == "-" else args.output
+
+    schema_md = get_neo4j_schema_markdown(
+        uri=args.uri,
+        username=args.user,
+        password=password,
+        database=args.database,
+        example_count=args.example_count,
+        output_path=output_path,
+    )
     print(schema_md)
+
+
+if __name__ == "__main__":
+    main()
