@@ -85,7 +85,99 @@ MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http").strip().lower()
 MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
 
-SCHEMA_DOC_PATH = _REPO_ROOT / "utils" / "neo4j_schema.md"
+# Schema documentation. The server can be pointed at either the *original*
+# Neo4j database (described by ``utils/neo4j_schema.md``) or the migrated
+# *target* database (described by ``utils/neo4j_export_schema.md``). Both share
+# the same core labels/relationships, so every declarative tool works against
+# either; only the schema doc surfaced by ``get_neo4j_schema`` differs. The
+# correct doc is resolved at runtime by matching the connected
+# ``NEO4J_DATABASE`` against the database name recorded in each doc's title,
+# with an optional explicit ``NEO4J_SCHEMA_DOC`` override.
+_SCHEMA_DOC_DIR = _REPO_ROOT / "utils"
+_SCHEMA_DOC_CANDIDATES = (
+    _SCHEMA_DOC_DIR / "neo4j_schema.md",  # original `companies` database
+    _SCHEMA_DOC_DIR / "neo4j_export_schema.md",  # migrated target database
+)
+# Explicit operator override (absolute path, or relative to the repo root).
+_SCHEMA_DOC_OVERRIDE = os.getenv("NEO4J_SCHEMA_DOC", "").strip()
+
+# Backwards-compatible default used when nothing else matches.
+SCHEMA_DOC_PATH = _SCHEMA_DOC_CANDIDATES[0]
+
+# Parses the database name out of a schema-doc title, e.g.
+# "# Neo4j Graph Schema — `companies`" -> "companies". The separator may be an
+# em dash (U+2014), en dash (U+2013) or hyphen.
+_SCHEMA_TITLE_DB = re.compile(
+    r"#\s*Neo4j Graph Schema\s*[\u2014\u2013-]\s*`?([^`\n]+?)`?\s*$",
+    re.MULTILINE,
+)
+
+# Cache the resolved doc so the title files are only parsed once per process.
+_schema_doc_resolved: Path | None = None
+
+
+def _schema_doc_db_name(path: Path) -> str | None:
+    """Return the database name recorded in a schema doc's title, if any."""
+    try:
+        head = path.read_text(encoding="utf-8")[:512]
+    except OSError:
+        return None
+    match = _SCHEMA_TITLE_DB.search(head)
+    return match.group(1).strip() if match else None
+
+
+def _resolve_schema_doc() -> Path | None:
+    """Pick the schema doc that matches the connected database (cached).
+
+    Resolution order:
+      1. ``NEO4J_SCHEMA_DOC`` explicit override (if it exists).
+      2. The candidate whose title database name equals ``NEO4J_DATABASE``.
+      3. The first existing candidate (backwards-compatible default).
+    """
+    global _schema_doc_resolved
+    if _schema_doc_resolved is not None:
+        return _schema_doc_resolved
+
+    # 1. Explicit operator override always wins.
+    if _SCHEMA_DOC_OVERRIDE:
+        override = Path(_SCHEMA_DOC_OVERRIDE)
+        if not override.is_absolute():
+            override = _REPO_ROOT / override
+        if override.exists():
+            _schema_doc_resolved = override
+            logger.info("Using schema doc from NEO4J_SCHEMA_DOC=%s.", override)
+            return override
+        logger.warning(
+            "NEO4J_SCHEMA_DOC=%s not found; falling back to auto-detection.",
+            _SCHEMA_DOC_OVERRIDE,
+        )
+
+    # 2. Match the connected database against each doc's recorded title name.
+    target_db = (NEO4J_DATABASE or "").strip().lower()
+    if target_db:
+        for path in _SCHEMA_DOC_CANDIDATES:
+            doc_db = _schema_doc_db_name(path)
+            if doc_db and doc_db.lower() == target_db:
+                _schema_doc_resolved = path
+                logger.info(
+                    "Resolved schema doc %s for database '%s'.",
+                    path.name,
+                    NEO4J_DATABASE,
+                )
+                return path
+
+    # 3. Backwards-compatible fallback: first candidate that exists on disk.
+    for path in _SCHEMA_DOC_CANDIDATES:
+        if path.exists():
+            _schema_doc_resolved = path
+            logger.info(
+                "No schema doc matched database '%s'; defaulting to %s.",
+                NEO4J_DATABASE,
+                path.name,
+            )
+            return path
+
+    return None
 
 # --------------------------------------------------------------------------- #
 # Logging (raw stack traces go to the internal error stream, never to the LLM)
@@ -279,13 +371,17 @@ mcp = FastMCP(
     host=MCP_HOST,
     port=MCP_PORT,
     instructions=(
-        "Read-only MCP server for the Neo4j `companies` graph. Prefer the "
-        "declarative tools (get_industries, get_companies_in_industry, "
-        "get_articles_with_sentiment, get_people_in_organizations, "
-        "find_investor_by_name, find_investor_by_id, "
-        "find_investors_for_companies). Use get_neo4j_schema + "
-        "run_cypher_query only for ad-hoc graph traversals not covered by a "
-        "declarative tool. All inputs are passed as native Cypher parameters."
+        "Read-only MCP server for the Neo4j companies knowledge graph "
+        "(supports both the original `companies` database and the migrated "
+        "target database — they share the same core labels/relationships). "
+        "Prefer the declarative tools (get_industries, "
+        "get_companies_in_industry, get_articles_with_sentiment, "
+        "get_people_in_organizations, find_investor_by_name, "
+        "find_investor_by_id, find_investors_for_companies). Use "
+        "get_neo4j_schema + run_cypher_query only for ad-hoc graph traversals "
+        "not covered by a declarative tool. get_neo4j_schema returns the "
+        "schema for whichever database is connected. All inputs are passed as "
+        "native Cypher parameters."
     ),
 )
 
@@ -585,13 +681,16 @@ def find_investors_for_companies(
 def get_neo4j_schema() -> str:
     """Return the graph schema (node labels, properties, relationships).
 
-    Routing: Graph Database Agent. Input: none. Reads the pre-computed
-    ``utils/neo4j_schema.md`` so the LLM can author correct ad-hoc Cypher.
+    Routing: Graph Database Agent. Input: none. Reads the pre-computed schema
+    doc matching the connected database (``utils/neo4j_schema.md`` for the
+    original ``companies`` graph or ``utils/neo4j_export_schema.md`` for the
+    migrated target graph) so the LLM can author correct ad-hoc Cypher.
     """
 
     def _run() -> str:
-        if SCHEMA_DOC_PATH.exists():
-            return SCHEMA_DOC_PATH.read_text(encoding="utf-8")
+        doc = _resolve_schema_doc()
+        if doc is not None and doc.exists():
+            return doc.read_text(encoding="utf-8")
         # Fallback: live, sampled introspection (cap nodes per label).
         return _live_schema()
 
