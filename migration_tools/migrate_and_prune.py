@@ -432,10 +432,23 @@ def grow_cluster_nodes(
                 is_article = "Article" in labels
                 is_chunk = "Chunk" in labels
 
+                # Hard truncation checks remain intact.
                 if is_article and article_count >= MAX_ARTICLES:
                     continue
                 if is_chunk and chunk_count >= MAX_CHUNKS:
                     continue
+
+                # Ratio throttle (expansion phase only): if Chunks are lagging
+                # behind the derived CHUNK_TO_ARTICLE_RATIO, defer taking on new
+                # Articles so the already-seeded Article anchors can let the
+                # frontier catch up on their dependent Chunk leaves. Without this,
+                # the global MAX_TOTAL_NODES ceiling is hit while the topology is
+                # still Article-heavy, starving the graph of Chunks.
+                if is_article:
+                    expected_chunks = math.floor(article_count * CHUNK_TO_ARTICLE_RATIO)
+                    if chunk_count < expected_chunks:
+                        continue
+
                 if len(selected) >= MAX_TOTAL_NODES:
                     break
 
