@@ -6,8 +6,7 @@ import torch
 import numpy as np
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
-from transformers import AutoTokenizer
-from optimum.onnxruntime import ORTModelForFeatureExtraction
+from sentence_transformers import SentenceTransformer
 
 # -------------------------------------------------------------------------
 # 1. Configuration & Connection Setup
@@ -20,9 +19,9 @@ NEO4J_URI = os.environ["SOURCE_NEO4J_URI"]
 NEO4J_USER = os.environ["SOURCE_NEO4J_USER"]
 NEO4J_PASSWORD = os.environ["SOURCE_NEO4J_PASSWORD"]
 
-MODEL_ID = "jinaai/jina-embeddings-v5-text-nano-retrieval"
+MODEL_ID = "jinaai/jina-embeddings-v5-text-nano"
 TEST_SAMPLE_SIZE = 300  # Number of real chunks pulled to run the benchmark
-BATCH_SIZES_TO_PROFILE = [8, 16, 32]  # Profiles performance across various memory scales
+BATCH_SIZES_TO_PROFILE = [1, 8, 16, 32]  # Profile single item execution along with batches
 
 print("⚡ Connecting to Neo4j to pull real text samples...")
 query = "MATCH (c:Chunk) WHERE c.text IS NOT NULL RETURN c.text LIMIT $limit"
@@ -30,8 +29,7 @@ query = "MATCH (c:Chunk) WHERE c.text IS NOT NULL RETURN c.text LIMIT $limit"
 with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD)) as driver:
     with driver.session() as session:
         result = session.run(query, limit=TEST_SAMPLE_SIZE)
-        # Jina Retrieval expects the formal "Document: " namespace prefix
-        raw_texts = [f"Document: {row['c.text']}" for row in result]
+        raw_texts = [row["c.text"] for row in result]
 
 if not raw_texts:
     raise ValueError("Database returned 0 records. Ensure your label matches 'Chunk' and property matches '.text'.")
@@ -41,23 +39,31 @@ print(f" Ready. Loaded {len(raw_texts)} real chunks (Avg chars: {np.mean([len(t)
 # -------------------------------------------------------------------------
 # 2. Initialize Model and Runtime Environments
 # -------------------------------------------------------------------------
-print("\n⚙️ Initializing Jina-v5-Nano via ONNX Runtime Engine...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+print(f"\n⚙️ Initializing {MODEL_ID} via Sentence-Transformers Engine...")
 
-# Detect if your machine can use hardware acceleration (CUDA/GPU)
-device_provider = "CPUExecutionProvider"
-if torch.cuda.is_available():
-    device_provider = "CUDAExecutionProvider"
+# Detect hardware acceleration target
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+config_kwargs = {}
+if device == "cuda":
     print("🚀 CUDA Detected! Running benchmark using GPU acceleration.")
+    # Check compute capability for optimal attention backend setup
+    if torch.cuda.get_device_capability()[0] >= 8:
+        config_kwargs["_attn_implementation"] = "flash_attention_2"
+        print("  -> Ampere+ Architecture found: Flash Attention 2 Enabled.")
+    else:
+        config_kwargs["_attn_implementation"] = "sdpa"
+        print("  -> Pre-Ampere Architecture found: Using PyTorch SDPA.")
 else:
     print("💻 No GPU environment found. Benchmarking using pure CPU execution.")
+    config_kwargs["_attn_implementation"] = "sdpa"
 
-model = ORTModelForFeatureExtraction.from_pretrained(
+model = SentenceTransformer(
     MODEL_ID,
-    subfolder="onnx",
-    file_name="model.onnx",
-    provider=device_provider,
     trust_remote_code=True,
+    device=device,
+    model_kwargs={"dtype": torch.bfloat16 if device == "cuda" else torch.float32},
+    config_kwargs=config_kwargs,
 )
 
 # -------------------------------------------------------------------------
@@ -65,30 +71,28 @@ model = ORTModelForFeatureExtraction.from_pretrained(
 # -------------------------------------------------------------------------
 print("\n=== Commencing Local Vector Throughput Test ===")
 
+# Warm-up pass to let CUDA compile kernels before profiling begins
+model.encode(raw_texts[:2], batch_size=2, task="retrieval", prompt_name="document", show_progress_bar=False)
+
 for batch_size in BATCH_SIZES_TO_PROFILE:
     print(f"\nProcessing Group Configuration: [Batch Size: {batch_size}]")
     
     start_time = time.perf_counter()
-    processed_count = 0
-
-    for i in range(0, len(raw_texts), batch_size):
-        batch = raw_texts[i : i + batch_size]
+    
+    # Run the embeddings through the optimized engine
+    with torch.inference_mode():
+        embeddings = model.encode(
+            sentences=raw_texts,
+            batch_size=batch_size,
+            task="retrieval",
+            prompt_name="document",
+            show_progress_bar=False,
+            convert_to_tensor=True
+        )
         
-        # Tokenize chunk and push attention masks
-        inputs = tokenizer(batch, padding=True, truncation=True, return_tensors="pt")
-        
-        with torch.no_grad():
-            outputs = model(**inputs)
-            
-        # Jina-v5 Specific Last-Token Pooling Strategy
-        last_hidden_state = outputs.last_hidden_state
-        sequence_lengths = inputs.attention_mask.sum(dim=1) - 1
-        embeddings = last_hidden_state[torch.arange(last_hidden_state.size(0)), sequence_lengths]
-        
-        processed_count += len(batch)
-
     end_time = time.perf_counter()
     elapsed_seconds = end_time - start_time
+    processed_count = len(raw_texts)
     chunks_per_second = processed_count / elapsed_seconds
     
     # Scale calculation up to your real full count (23,472 chunks)
