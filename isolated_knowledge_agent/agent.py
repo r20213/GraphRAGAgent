@@ -13,8 +13,6 @@ from typing import Any
 from google import genai
 from google.genai import types
 from neo4j import GraphDatabase
-from pymilvus import MilvusClient
-from pymilvus.exceptions import MilvusException
 
 LOGGER = logging.getLogger("knowledge-agent")
 
@@ -38,6 +36,24 @@ RETURN DISTINCT
   coalesce(toString(tgt.anchor_id), toString(tgt.id), toString(elementId(tgt))) AS anchor_id
 ORDER BY relationship_type, source_name, target_name
 LIMIT $candidate_limit
+"""
+
+CHUNK_RETRIEVAL_QUERY = """
+MATCH (anchor)
+WHERE anchor.id IN $anchor_ids OR elementId(anchor) IN $anchor_ids
+CALL {
+  WITH anchor
+  MATCH (anchor)<-[:MENTIONS]-(:Article)-[:HAS_CHUNK]->(c:Chunk)
+  RETURN c
+  UNION
+  WITH anchor
+  MATCH (anchor)-[:HAS_CHUNK]->(c:Chunk)
+  RETURN c
+}
+WITH DISTINCT c
+WHERE c.text IS NOT NULL
+RETURN c.text AS text
+LIMIT $chunk_limit
 """
 
 
@@ -77,15 +93,11 @@ class AgentConfig:
     neo4j_username: str
     neo4j_password: str
     neo4j_database: str
-    milvus_uri: str
-    milvus_token: str
-    milvus_collection: str
-    milvus_id_field: str
-    milvus_text_field: str
     degree_limit: int
     result_limit: int
     candidate_limit: int
     per_rel_limit: int
+    chunk_limit: int
     require_semantic_context: bool
     llm_model: str
 
@@ -95,8 +107,6 @@ class AgentConfig:
             "NEO4J_URI": os.environ.get("NEO4J_URI", ""),
             "NEO4J_USERNAME": os.environ.get("NEO4J_USERNAME", ""),
             "NEO4J_PASSWORD": os.environ.get("NEO4J_PASSWORD", ""),
-            "MILVUS_URI": os.environ.get("MILVUS_URI", ""),
-            "MILVUS_TOKEN": os.environ.get("MILVUS_TOKEN", ""),
             "GOOGLE_API_KEY": os.environ.get("GOOGLE_API_KEY", ""),
         }
         missing = [name for name, value in required.items() if not value]
@@ -108,17 +118,13 @@ class AgentConfig:
             neo4j_username=required["NEO4J_USERNAME"],
             neo4j_password=required["NEO4J_PASSWORD"],
             neo4j_database=os.environ.get("NEO4J_DATABASE", "neo4j"),
-            milvus_uri=required["MILVUS_URI"],
-            milvus_token=required["MILVUS_TOKEN"],
-            milvus_collection=os.environ.get("MILVUS_COLLECTION", "semantic_chunks"),
-            milvus_id_field=os.environ.get("MILVUS_ID_FIELD", "id"),
-            milvus_text_field=os.environ.get("MILVUS_TEXT_FIELD", "text"),
             degree_limit=int(os.environ.get("GRAPH_HUB_DEGREE_LIMIT", "300")),
             result_limit=int(os.environ.get("GRAPH_RESULT_LIMIT", "200")),
             candidate_limit=int(
                 os.environ.get("GRAPH_CANDIDATE_LIMIT", "2000")
             ),
             per_rel_limit=int(os.environ.get("GRAPH_PER_REL_LIMIT", "25")),
+            chunk_limit=int(os.environ.get("CHUNK_RETRIEVAL_LIMIT", "50")),
             require_semantic_context=(
                 os.environ.get("REQUIRE_SEMANTIC_CONTEXT", "true").strip().lower()
                 in {"1", "true", "yes", "on"}
@@ -136,7 +142,6 @@ class KnowledgeAgent:
             self.config.neo4j_uri,
             auth=(self.config.neo4j_username, self.config.neo4j_password),
         )
-        self._milvus = self._init_milvus_client()
         self._llm = genai.Client()
 
     def close(self) -> None:
@@ -263,22 +268,6 @@ class KnowledgeAgent:
         }
         return AgentResponse(answer=answer, metrics=metrics)
 
-    def _init_milvus_client(self) -> MilvusClient:
-        """Initialize Milvus tool with autonomous fail-safe handling."""
-        try:
-            return MilvusClient(
-                uri=self.config.milvus_uri,
-                token=self.config.milvus_token,
-            )
-        except MilvusException as exc:
-            LOGGER.exception("Milvus auth/network initialization failed: %s", exc)
-            raise RuntimeError(
-                "Milvus initialization failed. Verify MILVUS_URI and MILVUS_TOKEN."
-            ) from exc
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.exception("Unexpected Milvus initialization error: %s", exc)
-            raise RuntimeError("Unexpected Milvus initialization failure.") from exc
-
     def _graph_slice(self, target_entity: str) -> list[dict[str, str]]:
         """Run schema-agnostic query with degree-based path pruning."""
         pattern = self._build_entity_pattern(target_entity)
@@ -345,40 +334,36 @@ class KnowledgeAgent:
         return selected
 
     def _semantic_retrieve(self, anchor_ids: list[str]) -> tuple[list[str], str | None]:
-        """Retrieve semantic chunks using scalar expression id containment."""
+        """Retrieve semantic chunks directly from Neo4j via the graph.
+
+        Chunks are stored in Neo4j as `(:Chunk)` nodes connected through
+        `(:Article)-[:MENTIONS]->(anchor)` and `(:Article)-[:HAS_CHUNK]->(:Chunk)`
+        (and any direct `(anchor)-[:HAS_CHUNK]->(:Chunk)`). This replaces the
+        former external vector store: anchors discovered during graph slicing
+        are used to gather their grounded chunk text.
+        """
         if not anchor_ids:
             return [], None
 
-        expr = self._build_id_expression(anchor_ids)
         try:
-            result = self._milvus.query(
-                collection_name=self.config.milvus_collection,
-                filter=expr,
-                output_fields=[
-                    self.config.milvus_id_field,
-                    self.config.milvus_text_field,
-                ],
-                limit=max(len(anchor_ids), 1),
-            )
-        except MilvusException as exc:
-            LOGGER.warning("Milvus query network/cluster issue: %s", exc)
-            if self._is_collection_missing_error(exc):
-                return [], "milvus-collection-not-found"
-            return [], "milvus-query-failed"
+            with self._neo4j_driver.session(
+                database=self.config.neo4j_database
+            ) as session:
+                result = session.run(
+                    CHUNK_RETRIEVAL_QUERY,
+                    anchor_ids=anchor_ids,
+                    chunk_limit=self.config.chunk_limit,
+                )
+                chunks = [
+                    str(record["text"])
+                    for record in result
+                    if record["text"]
+                ]
         except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("Milvus query unexpected issue: %s", exc)
-            return [], "milvus-query-failed"
+            LOGGER.warning("Neo4j chunk retrieval failed: %s", exc)
+            return [], "chunk-retrieval-failed"
 
-        chunks: list[str] = []
-        for row in result:
-            if self.config.milvus_text_field in row and row[self.config.milvus_text_field]:
-                chunks.append(str(row[self.config.milvus_text_field]))
         return chunks, None
-
-    @staticmethod
-    def _is_collection_missing_error(exc: Exception) -> bool:
-        message = str(exc).lower()
-        return "collection not found" in message
 
     def _reason(self, user_query: str, grounded_context: str) -> str:
         """Use Gemini as deterministic final reasoning engine."""
@@ -408,7 +393,7 @@ class KnowledgeAgent:
             "No qualifying paths remained after degree pruning."
         ]
         chunk_lines = chunks or [
-            "No Milvus semantic chunks matched the anchor_id set."
+            "No graph-linked chunks matched the anchor set."
         ]
 
         return (
@@ -549,14 +534,6 @@ class KnowledgeAgent:
             seen.add(key)
             entities.append(token)
         return entities
-
-    def _build_id_expression(self, anchor_ids: list[str]) -> str:
-        quoted = [self._quote_literal(anchor_id) for anchor_id in anchor_ids]
-        return f"{self.config.milvus_id_field} in [{', '.join(quoted)}]"
-
-    @staticmethod
-    def _quote_literal(value: str) -> str:
-        return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
     @staticmethod
     def _format_triple(row: dict[str, str]) -> str:

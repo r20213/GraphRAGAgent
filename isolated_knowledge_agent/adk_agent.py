@@ -48,7 +48,7 @@ def build_agent() -> Agent:
         model=AGENT_MODEL,
         description=(
             "Autonomous knowledge agent wrapper that runs schema-agnostic "
-            "graph pruning + Milvus contextual anchoring and returns answer "
+            "graph pruning + Neo4j-native chunk retrieval and returns answer "
             "with execution metrics."
         ),
         instruction=SYSTEM_INSTRUCTION,
