@@ -1,4 +1,0 @@
-neo4j>=5.20.0
-python-dotenv>=1.0.0
-google-adk>=1.0.0
-google-genai>=1.0.0
