@@ -451,9 +451,13 @@ def search_entities_fts(
     properties (``name``, ``title``, ``author``, ``siteName``) whose value
     contains the query term, so the agent knows exactly why a node matched.
     """
+    # No index-level limit: let queryNodes return the full match pool so the
+    # custom ORDER BY ranks exact field matches above raw-score fuzzy hits.
+    # Neo4j's planner applies the trailing LIMIT as a top-n sort, so only
+    # top_k rows are streamed back regardless of pool size.
     fts_cypher = (
         'CALL db.index.fulltext.queryNodes('
-        '"global_entity_search", $query, {limit: $top_k}) '
+        '"global_entity_search", $query) '
         "YIELD node, score "
         "WITH node, score, "
         # Tell the agent exactly which property triggered the match so it does
@@ -462,6 +466,8 @@ def search_entities_fts(
         "   WHERE node[key] IS NOT NULL "
         "     AND toLower(toString(node[key])) CONTAINS toLower($query)] "
         "  AS matched_fields "
+        # Sort the entire pool: exact field matches first, raw score breaks ties.
+        "ORDER BY size(matched_fields) DESC, score DESC "
         "RETURN "
         "  labels(node) AS labels, "
         "  score, "
@@ -470,10 +476,8 @@ def search_entities_fts(
         "  node.author  AS author, "
         "  node.siteName AS site_name, "
         "  matched_fields "
-        # Push records with an exact literal field match to the top; the raw
-        # Lucene score only breaks ties. This stops loosely-scored fuzzy hits
-        # from outranking precise matches.
-        "ORDER BY size(matched_fields) DESC, score DESC"
+        # Slice the top_k out of the fully-sorted list (top-n sort in-engine).
+        "LIMIT $top_k"
     )
 
     def _run() -> str:
