@@ -121,11 +121,11 @@ def test_initialize_global_fts_index_recreates_index_with_exact_targets(
         "Person",
     }:
         assert f"`{label}`" in create_query
-    assert "n.author" in create_query
-    assert "n.name" in create_query
-    assert "n.title" in create_query
-    assert "n.siteName" in create_query
-    assert "n.motto" not in create_query
+    assert "n.`author`" in create_query
+    assert "n.`name`" in create_query
+    assert "n.`title`" in create_query
+    assert "n.`siteName`" in create_query
+    assert "n.`motto`" not in create_query
 
 
 def test_initialize_global_fts_index_reports_missing_required_targets(
