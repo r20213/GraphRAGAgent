@@ -277,6 +277,42 @@ def initialize_global_fts_index() -> dict[str, Any]:
                 "[schema-indexing] Initialized global_entity_search "
                 f"(labels={len(selected_labels)}, properties={len(selected_properties)})."
             )
+
+            # Verify what the server actually stored, on this exact session/db.
+            try:
+                server_view = session.run(
+                    "SHOW INDEXES YIELD name, labelsOrTypes, properties, state "
+                    "WHERE name = 'global_entity_search' "
+                    "RETURN labelsOrTypes, properties, state"
+                ).single()
+                if server_view is None:
+                    _stderr(
+                        "[schema-indexing] Verification: SHOW INDEXES returned no "
+                        "row for global_entity_search on this database. The browser "
+                        "and indexer may be pointed at different databases."
+                    )
+                else:
+                    server_labels = server_view["labelsOrTypes"] or []
+                    server_props = server_view["properties"] or []
+                    _stderr(
+                        "[schema-indexing] Verification (server view, db="
+                        f"{NEO4J_DATABASE}): labelsOrTypes={_safe_json(server_labels)}, "
+                        f"properties={_safe_json(server_props)}, "
+                        f"state={server_view['state']}."
+                    )
+                    if not server_props:
+                        _stderr(
+                            "[schema-indexing] WARNING: server reports empty "
+                            "properties for global_entity_search even though CREATE "
+                            "succeeded. Inspect the executed CREATE statement:\n"
+                            f"{create_query}"
+                        )
+            except Neo4jError as verify_exc:
+                _stderr(
+                    "[schema-indexing] Verification query failed: "
+                    f"{verify_exc.message if hasattr(verify_exc, 'message') else str(verify_exc)}"
+                )
+
             return summary
 
     except Neo4jError as exc:
