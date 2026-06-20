@@ -64,7 +64,16 @@ EXCLUDED_FTS_PROPERTIES = {
     "embedding",
     "embed_model_name",
     "motto",
-    "title",
+}
+
+# Explicit FTS targets requested for the unified index.
+REQUIRED_FTS_TARGETS: dict[str, set[str]] = {
+    "Article": {"title", "author"},
+    "Person": {"name"},
+    "Organization": {"name"},
+    "City": {"name"},
+    "Country": {"name"},
+    "IndustryCategory": {"name"},
 }
 
 _IDENTIFIER_KEYS = {
@@ -160,9 +169,13 @@ def _discover_string_properties(session, label: str) -> list[str]:
 def _should_include_fts_property(label: str, prop: str) -> bool:
     if label in EXCLUDED_LABELS:
         return False
+    allowed_props = REQUIRED_FTS_TARGETS.get(label, set())
+    if prop not in allowed_props:
+        return False
     if _is_identifier_property(prop):
         return False
-    if prop.lower() in EXCLUDED_FTS_PROPERTIES:
+    # Explicitly allowed targets win over broad exclusions, e.g. Article.title.
+    if prop.lower() in EXCLUDED_FTS_PROPERTIES and prop not in allowed_props:
         return False
     return True
 
@@ -192,6 +205,7 @@ def initialize_global_fts_index() -> dict[str, Any]:
 
             selected_labels: list[str] = []
             selected_properties: set[str] = set()
+            included_targets: set[tuple[str, str]] = set()
 
             for label in labels:
                 if label in EXCLUDED_LABELS:
@@ -205,6 +219,20 @@ def initialize_global_fts_index() -> dict[str, Any]:
                 if includable:
                     selected_labels.append(label)
                     selected_properties.update(includable)
+                    included_targets.update((label, prop) for prop in includable)
+
+            expected_targets = {
+                (label, prop)
+                for label, props in REQUIRED_FTS_TARGETS.items()
+                for prop in props
+            }
+            missing_targets = sorted(expected_targets - included_targets)
+            if missing_targets:
+                _stderr(
+                    "[schema-indexing] Warning: some required FTS targets "
+                    "were not discovered in live schema: "
+                    f"{_safe_json(missing_targets)}"
+                )
 
             if not selected_labels or not selected_properties:
                 _stderr(
