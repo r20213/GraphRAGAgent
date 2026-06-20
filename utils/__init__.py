@@ -16,9 +16,15 @@ from typing import TYPE_CHECKING, Any
 # Map of public attribute name -> defining submodule.
 _LAZY_EXPORTS = {
     "get_neo4j_schema_markdown": "utils.eda",
+    "initialize_global_fts_index": "utils.schema_indexing",
+    "index_relationship_schema_vectors": "utils.schema_indexing",
 }
 
-__all__ = ["get_neo4j_schema_markdown"]
+__all__ = [
+    "get_neo4j_schema_markdown",
+    "initialize_global_fts_index",
+    "index_relationship_schema_vectors",
+]
 
 
 def __getattr__(name: str) -> Any:
@@ -40,4 +46,10 @@ def __dir__() -> list[str]:
 
 if TYPE_CHECKING:  # Static type-checkers / IDEs see the real symbol.
     from utils.eda import get_neo4j_schema_markdown as get_neo4j_schema_markdown
+    from utils.schema_indexing import (
+        index_relationship_schema_vectors as index_relationship_schema_vectors,
+    )
+    from utils.schema_indexing import (
+        initialize_global_fts_index as initialize_global_fts_index,
+    )
 
