@@ -446,6 +446,10 @@ def search_entities_fts(
 
     Lucene syntax is supported (e.g. ``"Acme~"``, ``"Google OR Apple"``).
     Results are ranked by relevance score descending.
+
+    Each result includes a ``matched_fields`` list naming the specific
+    properties (``name``, ``title``, ``author``, ``siteName``) whose value
+    contains the query term, so the agent knows exactly why a node matched.
     """
     fts_cypher = (
         'CALL db.index.fulltext.queryNodes('
@@ -457,7 +461,13 @@ def search_entities_fts(
         "  node.name    AS name, "
         "  node.title   AS title, "
         "  node.author  AS author, "
-        "  node.siteName AS site_name "
+        "  node.siteName AS site_name, "
+        # Tell the agent exactly which property triggered the match so it does
+        # not have to guess why a node is relevant. Case-insensitive contains.
+        "  [key IN ['name', 'title', 'author', 'siteName'] "
+        "   WHERE node[key] IS NOT NULL "
+        "     AND toLower(toString(node[key])) CONTAINS toLower($query)] "
+        "  AS matched_fields "
         "ORDER BY score DESC"
     )
 
