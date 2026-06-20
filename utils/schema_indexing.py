@@ -243,7 +243,10 @@ def initialize_global_fts_index() -> dict[str, Any]:
 
             labels_union = "|".join(_quote_ident(l) for l in sorted(selected_labels))
             prop_list = ", ".join(
-                f"n.{_quote_ident(p)}" for p in sorted(selected_properties)
+                # NOTE: property names in ON EACH must be UNQUOTED. On Neo4j 5.x
+                # Aura, backtick-quoting here (n.`prop`) silently creates an
+                # empty index with no indexed properties.
+                f"n.{p}" for p in sorted(selected_properties)
             )
 
             # Always drop-and-recreate so exclusion rule changes take effect.
