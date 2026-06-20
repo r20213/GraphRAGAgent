@@ -455,6 +455,13 @@ def search_entities_fts(
         'CALL db.index.fulltext.queryNodes('
         '"global_entity_search", $query, {limit: $top_k}) '
         "YIELD node, score "
+        "WITH node, score, "
+        # Tell the agent exactly which property triggered the match so it does
+        # not have to guess why a node is relevant. Case-insensitive contains.
+        "  [key IN ['name', 'title', 'author', 'siteName'] "
+        "   WHERE node[key] IS NOT NULL "
+        "     AND toLower(toString(node[key])) CONTAINS toLower($query)] "
+        "  AS matched_fields "
         "RETURN "
         "  labels(node) AS labels, "
         "  score, "
@@ -462,13 +469,11 @@ def search_entities_fts(
         "  node.title   AS title, "
         "  node.author  AS author, "
         "  node.siteName AS site_name, "
-        # Tell the agent exactly which property triggered the match so it does
-        # not have to guess why a node is relevant. Case-insensitive contains.
-        "  [key IN ['name', 'title', 'author', 'siteName'] "
-        "   WHERE node[key] IS NOT NULL "
-        "     AND toLower(toString(node[key])) CONTAINS toLower($query)] "
-        "  AS matched_fields "
-        "ORDER BY score DESC"
+        "  matched_fields "
+        # Push records with an exact literal field match to the top; the raw
+        # Lucene score only breaks ties. This stops loosely-scored fuzzy hits
+        # from outranking precise matches.
+        "ORDER BY size(matched_fields) DESC, score DESC"
     )
 
     def _run() -> str:
