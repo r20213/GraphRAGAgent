@@ -76,21 +76,6 @@ NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "companies")
 NEO4J_READONLY_USERNAME = os.getenv("NEO4J_READONLY_USERNAME", "").strip()
 NEO4J_READONLY_PASSWORD = os.getenv("NEO4J_READONLY_PASSWORD", "")
 
-READ_ONLY = os.getenv("NEO4J_READ_ONLY", "true").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-# When true (default) the server probes the target at startup to *prove* that
-# writes are rejected and refuses to start otherwise (fail-closed). This is a
-# server/permission-level guardrail independent of the syntactic write check.
-VERIFY_READ_ONLY = os.getenv("NEO4J_VERIFY_READ_ONLY", "true").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
 QUERY_TIMEOUT = float(os.getenv("NEO4J_QUERY_TIMEOUT", "15"))
 MAX_RESULT_RECORDS = int(os.getenv("MAX_RESULT_RECORDS", "100"))
 SCHEMA_SAMPLE_LIMIT = int(os.getenv("SCHEMA_SAMPLE_LIMIT", "1000"))
@@ -237,7 +222,7 @@ def get_driver():
         )
         # Fail fast on a broken endpoint / bad credentials.
         _driver.verify_connectivity()
-        logger.info("Neo4j driver pool ready (read_only=%s).", READ_ONLY)
+        logger.info("Neo4j driver pool ready.")
     return _driver
 
 
@@ -268,25 +253,6 @@ for _sig in (signal.SIGTERM, signal.SIGINT):
     except (ValueError, OSError):  # pragma: no cover - non-main thread
         # signal.signal only works in the main thread; safe to skip otherwise.
         pass
-
-# --------------------------------------------------------------------------- #
-# Security: write-clause detection for the ad-hoc Cypher fallback
-# --------------------------------------------------------------------------- #
-_WRITE_CLAUSE = re.compile(
-    r"\b(CREATE|MERGE|DELETE|DETACH\s+DELETE|SET|REMOVE|DROP|FOREACH|"
-    r"LOAD\s+CSV|CALL\s+\{[^}]*\b(CREATE|MERGE|DELETE|SET)\b|"
-    r"apoc\.(create|merge|refactor)|CREATE\s+(INDEX|CONSTRAINT)|"
-    r"CALL\s+db\.create)\b",
-    re.IGNORECASE,
-)
-
-
-def _is_write_query(cypher: str) -> bool:
-    """Heuristically detect whether a Cypher statement mutates the graph."""
-    # Strip string literals so keywords inside data values do not trigger.
-    stripped = re.sub(r"'[^']*'|\"[^\"]*\"", "", cypher)
-    return bool(_WRITE_CLAUSE.search(stripped))
-
 
 # --------------------------------------------------------------------------- #
 # Core read executor — single choke point for every tool
@@ -393,315 +359,30 @@ def _format_records(records: list[dict[str, Any]], empty_hint: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# MCP server + declarative pre-validated query catalogue
+# MCP server
 # --------------------------------------------------------------------------- #
 mcp = FastMCP(
-    "neo4j-companies",
+    "neo4j-graphrag",
     host=MCP_HOST,
     port=MCP_PORT,
     instructions=(
-        "Read-only MCP server for the Neo4j companies knowledge graph "
-        "(supports both the original `companies` database and the migrated "
-        "target database — they share the same core labels/relationships). "
-        "Prefer the declarative tools (get_industries, "
-        "get_companies_in_industry, get_articles_with_sentiment, "
-        "get_people_in_organizations, find_investor_by_name, "
-        "find_investor_by_id, find_investors_for_companies). Use "
-        "get_neo4j_schema + run_cypher_query only for ad-hoc graph traversals "
-        "not covered by a declarative tool. get_neo4j_schema returns the "
-        "schema for whichever database is connected. All inputs are passed as "
-        "native Cypher parameters."
+        "Read-only MCP server for the Neo4j GraphRAG pipeline. "
+        "Writes are rejected at the driver level via READ_ACCESS mode — "
+        "no regex guardrail required. "
+        "Use search_entities_fts to run full-text searches across the "
+        "global_entity_search index (covers Article.title, Article.author, "
+        "Article.siteName, and .name on Person/Organization/City/Country/"
+        "IndustryCategory). "
+        "Use run_graph_query for arbitrary read-only Cypher traversals. "
+        "Use get_neo4j_schema to inspect labels, properties and relationships "
+        "before authoring Cypher."
     ),
 )
 
-# Declarative, expert-authored query templates. The graph uses `Organization`
-# (companies), `IndustryCategory` (industries) and `HAS_INVESTOR` / `HAS_CEO`
-# / `HAS_BOARD_MEMBER` relationships per utils/neo4j_schema.md.
-QUERY_TEMPLATES: dict[str, dict[str, str]] = {
-    "get_industries": {
-        "description": "Fetch all industries (IndustryCategory) from database.",
-        "query": """
-            MATCH (i:IndustryCategory)
-            RETURN i.name AS name, i.id AS id
-            ORDER BY name
-        """,
-    },
-    "get_companies_in_industry": {
-        "description": "List companies (Organizations) within an industry.",
-        "query": """
-            MATCH (o:Organization)-[:HAS_CATEGORY]->(i:IndustryCategory)
-            WHERE toLower(i.name) = toLower($industry_name)
-            RETURN o.id AS id,
-                   o.name AS name,
-                   o.summary AS summary,
-                   o.nbrEmployees AS employees,
-                   o.revenue AS revenue,
-                   o.isPublic AS is_public
-            ORDER BY name
-        """,
-    },
-    "get_articles_with_sentiment": {
-        "description": "Articles filtered by minimum sentiment and optional date.",
-        "query": """
-            MATCH (a:Article)
-            WHERE a.sentiment >= $min_sentiment
-              AND ($year IS NULL OR a.date.year = $year)
-              AND ($month IS NULL OR a.date.month = $month)
-            RETURN a.title AS title,
-                   a.sentiment AS sentiment,
-                   a.date AS date,
-                   a.siteName AS site
-            ORDER BY a.sentiment DESC
-        """,
-    },
-    "get_people_in_organizations": {
-        "description": "Personnel matching a role within selected companies.",
-        "query": """
-            MATCH (o:Organization)-[rel]->(p:Person)
-            WHERE o.name IN $company_names
-              AND type(rel) IN $rel_types
-            RETURN o.name AS company,
-                   p.name AS person,
-                   p.summary AS details,
-                   type(rel) AS relationship
-            ORDER BY company, person
-        """,
-    },
-    "find_investor_by_name": {
-        "description": "Entities that invested in the target company.",
-        "query": """
-            MATCH (o:Organization)-[:HAS_INVESTOR]->(inv)
-            WHERE toLower(o.name) = toLower($company_name)
-            RETURN inv.name AS investor,
-                   inv.id AS investor_id,
-                   labels(inv) AS node_types
-            ORDER BY investor
-        """,
-    },
-    "find_investor_by_id": {
-        "description": "Full investment portfolio for a unique investor id.",
-        "query": """
-            MATCH (o:Organization)-[:HAS_INVESTOR]->(inv)
-            WHERE inv.id = $investor_id
-            RETURN inv.name AS investor,
-                   labels(inv) AS investor_type,
-                   collect({company: o.name, company_id: o.id})[..100] AS portfolio
-        """,
-    },
-    "find_investors_for_companies": {
-        "description": "Overlapping investors who funded multiple of the companies.",
-        "query": """
-            MATCH (o:Organization)-[:HAS_INVESTOR]->(inv)
-            WHERE toLower(o.name) IN [c IN $company_names | toLower(c)]
-            WITH inv,
-                 collect(DISTINCT o.name) AS funded_companies
-            WHERE size(funded_companies) >= $min_overlap
-            RETURN inv.name AS investor,
-                   inv.id AS investor_id,
-                   labels(inv) AS node_types,
-                   funded_companies,
-                   size(funded_companies) AS overlap_count
-            ORDER BY overlap_count DESC, investor
-        """,
-    },
-}
-
-# Map human role names to the graph's relationship types.
-_ROLE_TO_RELS: dict[str, list[str]] = {
-    "ceo": ["HAS_CEO"],
-    "board member": ["HAS_BOARD_MEMBER"],
-    "board": ["HAS_BOARD_MEMBER"],
-    "director": ["HAS_BOARD_MEMBER"],
-    "any": ["HAS_CEO", "HAS_BOARD_MEMBER"],
-}
-
 
 # --------------------------------------------------------------------------- #
-# Investment Research Agent tools
+# Graph tools
 # --------------------------------------------------------------------------- #
-@mcp.tool()
-def get_industries(agent_session_id: str | None = None) -> str:
-    """List every available industry name and id.
-
-    Routing: Investment Research Agent. Input: none.
-    """
-    tmpl = QUERY_TEMPLATES["get_industries"]
-
-    def _run() -> str:
-        records = execute_read("get_industries", tmpl["query"], {}, agent_session_id)
-        return _format_records(records, "No industries found in the database.")
-
-    return _safe("get_industries", _run)
-
-
-@mcp.tool()
-def get_companies_in_industry(
-    industry_name: str, agent_session_id: str | None = None
-) -> str:
-    """List companies belonging to ``industry_name`` (case-insensitive).
-
-    Routing: Investment Research Agent. Input: industry_name (String).
-    """
-    tmpl = QUERY_TEMPLATES["get_companies_in_industry"]
-
-    def _run() -> str:
-        records = execute_read(
-            "get_companies_in_industry",
-            tmpl["query"],
-            {"industry_name": industry_name},
-            agent_session_id,
-        )
-        return _format_records(
-            records,
-            f"No companies found for industry '{industry_name}'. "
-            "Check the spelling or call get_industries() for valid names.",
-        )
-
-    return _safe("get_companies_in_industry", _run)
-
-
-@mcp.tool()
-def get_articles_with_sentiment(
-    min_sentiment: float,
-    year: int | None = None,
-    month: int | None = None,
-    agent_session_id: str | None = None,
-) -> str:
-    """Articles with sentiment >= ``min_sentiment``, optionally by year/month.
-
-    Routing: Investment Research Agent.
-    Input: min_sentiment (Float), year (Int, opt), month (Int, opt).
-    """
-    tmpl = QUERY_TEMPLATES["get_articles_with_sentiment"]
-
-    def _run() -> str:
-        records = execute_read(
-            "get_articles_with_sentiment",
-            tmpl["query"],
-            {"min_sentiment": min_sentiment, "year": year, "month": month},
-            agent_session_id,
-        )
-        return _format_records(
-            records,
-            "No articles matched the given sentiment/date filters.",
-        )
-
-    return _safe("get_articles_with_sentiment", _run)
-
-
-@mcp.tool()
-def get_people_in_organizations(
-    company_names: list[str],
-    role: str = "any",
-    agent_session_id: str | None = None,
-) -> str:
-    """Personnel matching ``role`` (e.g. "CEO") in the given companies.
-
-    Routing: Investment Research Agent.
-    Input: company_names (List[String]), role (String).
-    """
-    tmpl = QUERY_TEMPLATES["get_people_in_organizations"]
-    rel_types = _ROLE_TO_RELS.get(role.strip().lower(), _ROLE_TO_RELS["any"])
-
-    def _run() -> str:
-        records = execute_read(
-            "get_people_in_organizations",
-            tmpl["query"],
-            {"company_names": company_names, "rel_types": rel_types},
-            agent_session_id,
-        )
-        return _format_records(
-            records,
-            f"No '{role}' personnel found for the supplied companies.",
-        )
-
-    return _safe("get_people_in_organizations", _run)
-
-
-# --------------------------------------------------------------------------- #
-# Investor Research Agent tools
-# --------------------------------------------------------------------------- #
-@mcp.tool()
-def find_investor_by_name(
-    company_name: str, agent_session_id: str | None = None
-) -> str:
-    """Find entities (Person/Organization) that invested in ``company_name``.
-
-    Routing: Investor Research Agent. Input: company_name (String).
-    """
-    tmpl = QUERY_TEMPLATES["find_investor_by_name"]
-
-    def _run() -> str:
-        records = execute_read(
-            "find_investor_by_name",
-            tmpl["query"],
-            {"company_name": company_name},
-            agent_session_id,
-        )
-        return _format_records(
-            records,
-            f"No investors found for company '{company_name}'. "
-            "Verify the company name spelling.",
-        )
-
-    return _safe("find_investor_by_name", _run)
-
-
-@mcp.tool()
-def find_investor_by_id(
-    investor_id: str, agent_session_id: str | None = None
-) -> str:
-    """Return the full investment portfolio for a unique ``investor_id``.
-
-    Routing: Investor Research Agent. Input: investor_id (String/Int).
-    """
-    tmpl = QUERY_TEMPLATES["find_investor_by_id"]
-
-    def _run() -> str:
-        records = execute_read(
-            "find_investor_by_id",
-            tmpl["query"],
-            {"investor_id": str(investor_id)},
-            agent_session_id,
-        )
-        return _format_records(
-            records,
-            f"No investor found with id '{investor_id}'.",
-        )
-
-    return _safe("find_investor_by_id", _run)
-
-
-@mcp.tool()
-def find_investors_for_companies(
-    company_names: list[str],
-    min_overlap: int = 2,
-    agent_session_id: str | None = None,
-) -> str:
-    """Identify investors who funded multiple of the supplied companies.
-
-    Routing: Investor Research Agent. Input: company_names (List[String]),
-    min_overlap (Int, default 2 — minimum number of listed companies an
-    investor must have funded to be considered "overlapping").
-    """
-    tmpl = QUERY_TEMPLATES["find_investors_for_companies"]
-    overlap = max(1, int(min_overlap))
-
-    def _run() -> str:
-        records = execute_read(
-            "find_investors_for_companies",
-            tmpl["query"],
-            {"company_names": company_names, "min_overlap": overlap},
-            agent_session_id,
-        )
-        return _format_records(
-            records,
-            "No overlapping investors found across the supplied companies. "
-            "Verify the company name spellings or lower the overlap threshold.",
-        )
-
-    return _safe("find_investors_for_companies", _run)
-
 
 # --------------------------------------------------------------------------- #
 # Graph Database Agent tools (schema + ad-hoc fallback)
@@ -751,106 +432,78 @@ def _live_schema() -> str:
 
 
 @mcp.tool()
-def run_cypher_query(
-    cypher_query: str,
+def search_entities_fts(
+    query: str,
+    top_k: int = 20,
+    agent_session_id: str | None = None,
+) -> str:
+    """Full-text search across all indexed entity labels.
+
+    Searches the ``global_entity_search`` index which covers:
+    - ``Article``: title, author, siteName
+    - ``Person``, ``Organization``, ``City``, ``Country``,
+      ``IndustryCategory``: name
+
+    Lucene syntax is supported (e.g. ``"Acme~"``, ``"Google OR Apple"``).
+    Results are ranked by relevance score descending.
+    """
+    fts_cypher = (
+        'CALL db.index.fulltext.queryNodes('
+        '"global_entity_search", $query, {limit: $top_k}) '
+        "YIELD node, score "
+        "RETURN "
+        "  labels(node) AS labels, "
+        "  score, "
+        "  node.name    AS name, "
+        "  node.title   AS title, "
+        "  node.author  AS author, "
+        "  node.siteName AS site_name "
+        "ORDER BY score DESC"
+    )
+
+    def _run() -> str:
+        records = execute_read(
+            "search_entities_fts",
+            fts_cypher,
+            {"query": query, "top_k": top_k},
+            agent_session_id,
+            cap=top_k,
+        )
+        return _format_records(
+            records, f"No entities matched the full-text query: '{query}'."
+        )
+
+    return _safe("search_entities_fts", _run)
+
+
+@mcp.tool()
+def run_graph_query(
+    cypher: str,
     parameters: dict[str, Any] | None = None,
     agent_session_id: str | None = None,
 ) -> str:
-    """Execute an ad-hoc, read-only Cypher query for GraphRAG traversals.
+    """Execute an arbitrary read-only Cypher query against the graph.
 
-    Routing: Graph Database Agent. Use ``get_neo4j_schema()`` first to author
-    a correct statement. Pass any literals via ``parameters`` ($name syntax) —
-    never concatenate values into the query string.
-
-    Examples: ``MATCH (c:Organization) RETURN count(c) AS total`` or
-    ``MATCH (a:Organization)-[:HAS_COMPETITOR]->(b) RETURN a.name, b.name``.
+    Writes are rejected at the driver level by READ_ACCESS mode — no
+    application-level write check is needed. Use ``get_neo4j_schema`` first
+    to confirm label/property names. Pass all variable values via
+    ``parameters`` to avoid string-interpolation issues.
     """
 
     def _run() -> str:
-        if READ_ONLY and _is_write_query(cypher_query):
-            logger.warning("Rejected write query in read-only mode.")
-            return (
-                "Rejected: this server is read-only. Write clauses (CREATE, "
-                "MERGE, DELETE, SET, REMOVE, DROP, ...) are not permitted."
-            )
         records = execute_read(
-            "run_cypher_query",
-            cypher_query,
+            "run_graph_query",
+            cypher,
             parameters or {},
             agent_session_id,
         )
         return _format_records(records, "Query executed successfully; 0 rows.")
 
-    return _safe("run_cypher_query", _run)
+    return _safe("run_graph_query", _run)
 
 
-# --------------------------------------------------------------------------- #
-# Permission-level guardrail: prove the server rejects writes (fail-closed)
-# --------------------------------------------------------------------------- #
-# A trivial write used purely to confirm the server enforces read-only access.
-# It is executed inside a READ-access transaction that is *always* rolled back,
-# so nothing is ever persisted — even against a misconfigured writable endpoint.
-_READ_ONLY_PROBE = "CREATE (n:`__mcp_readonly_probe__`) RETURN id(n)"
 
 
-def verify_read_only_enforced() -> None:
-    """Confirm the database itself rejects writes; fail closed if it does not.
-
-    Unlike the syntactic :func:`_is_write_query` check, this is a true
-    server/permission-level guardrail. It opens a transaction in READ access
-    mode and attempts a write:
-
-    * A correctly enforced server raises immediately ("Writing in read access
-      mode not allowed", or a privilege error when using a read-only user). The
-      probe transaction is rolled back and startup proceeds.
-    * If the write is *not* rejected, the target is writable through this
-      connection. We roll back (so nothing is persisted) and raise, refusing to
-      start so the LLM-facing tools can never mutate the graph.
-
-    Set ``NEO4J_VERIFY_READ_ONLY=false`` to skip (not recommended for writable
-    targets such as Aura).
-    """
-    if not READ_ONLY:
-        logger.warning(
-            "NEO4J_READ_ONLY is disabled; skipping read-only enforcement probe."
-        )
-        return
-
-    driver = get_driver()
-    with driver.session(
-        database=NEO4J_DATABASE, default_access_mode=READ_ACCESS
-    ) as session:
-        tx = session.begin_transaction(
-            metadata={
-                "app": "neo4j-mcp-server",
-                "mcp_tool_name": "readonly_enforcement_probe",
-            }
-        )
-        try:
-            tx.run(_READ_ONLY_PROBE).consume()
-        except Neo4jError as exc:
-            # Expected path: the server blocked the write.
-            logger.info(
-                "Read-only enforcement verified: server rejected probe write "
-                "(%s).",
-                exc.code or "client error",
-            )
-            return
-        else:
-            raise RuntimeError(
-                "Read-only guardrail FAILED: the target database accepted a "
-                "write while in READ access mode. Refusing to start to prevent "
-                "unintended mutations. Connect with a read-only user "
-                "(NEO4J_READONLY_USERNAME/PASSWORD) or enable access-mode "
-                "enforcement on the server."
-            )
-        finally:
-            # Always roll back — guarantees the probe never persists anything,
-            # including on a writable endpoint where run() did not raise.
-            try:
-                tx.rollback()
-            except Exception:  # noqa: BLE001 - best-effort cleanup
-                pass
 
 
 # --------------------------------------------------------------------------- #
@@ -866,12 +519,9 @@ def main() -> None:
     """
     try:
         get_driver()  # fail fast before accepting MCP traffic
-        if VERIFY_READ_ONLY:
-            # Prove writes are rejected before exposing any tools (fail-closed).
-            verify_read_only_enforced()
     except Exception:  # noqa: BLE001
         logger.exception(
-            "Fatal: could not establish a verified read-only Neo4j connection."
+            "Fatal: could not establish a Neo4j connection."
         )
         close_driver()
         sys.exit(1)
@@ -879,19 +529,17 @@ def main() -> None:
     if MCP_TRANSPORT == "stdio":
         logger.info(
             "Starting Neo4j MCP server over stdio "
-            "(read_only=%s, timeout=%ss, cap=%s).",
-            READ_ONLY,
+            "(timeout=%ss, cap=%s).",
             QUERY_TIMEOUT,
             MAX_RESULT_RECORDS,
         )
     else:
         logger.info(
             "Starting Neo4j MCP server over %s on %s:%s "
-            "(read_only=%s, timeout=%ss, cap=%s).",
+            "(timeout=%ss, cap=%s).",
             MCP_TRANSPORT,
             MCP_HOST,
             MCP_PORT,
-            READ_ONLY,
             QUERY_TIMEOUT,
             MAX_RESULT_RECORDS,
         )
