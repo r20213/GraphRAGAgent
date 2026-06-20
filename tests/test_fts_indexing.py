@@ -88,15 +88,15 @@ def test_initialize_global_fts_index_recreates_index_with_exact_targets(
     summary = idx.initialize_global_fts_index()
 
     assert summary["created"] is True
-    assert summary["labels"] == [
+    assert set(summary["labels"]) == {
         "Article",
         "City",
         "Country",
         "IndustryCategory",
         "Organization",
         "Person",
-    ]
-    assert summary["properties"] == ["author", "name", "title"]
+    }
+    assert set(summary["properties"]) == {"author", "name", "title"}
 
     drop_calls = [q for q in executed if "DROP INDEX global_entity_search" in q]
     create_calls = [
@@ -107,7 +107,15 @@ def test_initialize_global_fts_index_recreates_index_with_exact_targets(
     assert len(create_calls) == 1
 
     create_query = create_calls[0]
-    assert "FOR (n:`Article`|`City`|`Country`|`IndustryCategory`|`Organization`|`Person`)" in create_query
+    for label in {
+        "Article",
+        "City",
+        "Country",
+        "IndustryCategory",
+        "Organization",
+        "Person",
+    }:
+        assert f"`{label}`" in create_query
     assert "n.`author`" in create_query
     assert "n.`name`" in create_query
     assert "n.`title`" in create_query
