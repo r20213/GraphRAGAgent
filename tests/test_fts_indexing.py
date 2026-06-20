@@ -23,9 +23,9 @@ def _result(rows):
 def test_should_include_fts_property_exact_targets_only(idx):
     assert idx._should_include_fts_property("Article", "title") is True
     assert idx._should_include_fts_property("Article", "author") is True
+    assert idx._should_include_fts_property("Article", "siteName") is True
     assert idx._should_include_fts_property("Organization", "name") is True
 
-    assert idx._should_include_fts_property("Article", "siteName") is False
     assert idx._should_include_fts_property("Organization", "motto") is False
     assert idx._should_include_fts_property("City", "id") is False
     assert idx._should_include_fts_property("Fewshot", "Question") is False
@@ -96,7 +96,12 @@ def test_initialize_global_fts_index_recreates_index_with_exact_targets(
         "Organization",
         "Person",
     }
-    assert set(summary["properties"]) == {"author", "name", "title"}
+    assert set(summary["properties"]) == {
+        "author",
+        "name",
+        "siteName",
+        "title",
+    }
 
     drop_calls = [q for q in executed if "DROP INDEX global_entity_search" in q]
     create_calls = [
@@ -119,7 +124,7 @@ def test_initialize_global_fts_index_recreates_index_with_exact_targets(
     assert "n.`author`" in create_query
     assert "n.`name`" in create_query
     assert "n.`title`" in create_query
-    assert "n.`siteName`" not in create_query
+    assert "n.`siteName`" in create_query
     assert "n.`motto`" not in create_query
 
 
