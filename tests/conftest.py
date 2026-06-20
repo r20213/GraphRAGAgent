@@ -1,28 +1,21 @@
-"""Shared pytest fixtures for the GraphRAGAgent test suite.
-
-The server is imported as a normal package (``from mcp_server import server``)
-thanks to the package ``__init__.py`` files and the ``pythonpath = .`` setting
-in ``pytest.ini`` — no ``sys.path`` / ``sys.modules`` manipulation required.
-
-Tests stay isolated from any live database by monkeypatching
-``server.get_driver`` with the :class:`FakeDriver` provided here.
-"""
+"""Shared fixtures for schema indexing tests."""
 
 from __future__ import annotations
 
 import pytest
 
-from mcp_server import server as _server
+from utils import schema_indexing as _schema_indexing
 
 
 @pytest.fixture()
-def srv():
-    """Return the imported MCP server module under test."""
-    return _server
+def idx(monkeypatch):
+    """Return the schema_indexing module with clean singleton state."""
+    monkeypatch.setattr(_schema_indexing, "_driver", None)
+    return _schema_indexing
 
 
 class FakeRecord:
-    """Mimics a neo4j Record: ``.data()`` returns a plain dict."""
+    """Dictionary-like record supporting [] access."""
 
     def __init__(self, data: dict):
         self._data = data
@@ -32,10 +25,10 @@ class FakeRecord:
 
 
 class FakeSession:
-    """Context-manager session whose ``run`` yields the configured records."""
+    """Context-manager session with configurable run handler."""
 
-    def __init__(self, records):
-        self._records = records
+    def __init__(self, run_handler):
+        self._run_handler = run_handler
         self.run_calls = []
 
     def __enter__(self):
@@ -46,22 +39,23 @@ class FakeSession:
 
     def run(self, query, params=None):
         self.run_calls.append((query, params))
-        return iter(self._records)
+        return self._run_handler(query, params or {})
 
 
 class FakeDriver:
-    """Driver stub returning a pre-seeded :class:`FakeSession`."""
+    """Driver stub returning a session with a custom run handler."""
 
-    def __init__(self, records):
-        self._records = records
+    def __init__(self, run_handler):
+        self._run_handler = run_handler
         self.session_kwargs = None
+        self.closed = False
 
     def session(self, **kwargs):
         self.session_kwargs = kwargs
-        return FakeSession(self._records)
+        return FakeSession(self._run_handler)
 
     def close(self):
-        pass
+        self.closed = True
 
     def verify_connectivity(self):
         return True
@@ -69,9 +63,9 @@ class FakeDriver:
 
 @pytest.fixture()
 def fake_driver_factory():
-    """Factory that builds a FakeDriver from a list of record dicts."""
+    """Factory that builds a FakeDriver from a run-handler callback."""
 
-    def _make(record_dicts):
-        return FakeDriver([FakeRecord(d) for d in record_dicts])
+    def _make(run_handler):
+        return FakeDriver(run_handler)
 
     return _make
