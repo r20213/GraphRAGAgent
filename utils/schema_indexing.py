@@ -38,7 +38,7 @@ load_dotenv(_REPO_ROOT / ".env")
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 NEO4J_URI = os.getenv("NEO4J_URI", "neo4j://localhost:7687")
-NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
+NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "companies")
 
 # Prefer dedicated least-privilege indexer credentials when provided.
 NEO4J_INDEXER_USERNAME = os.getenv(
@@ -243,7 +243,7 @@ def initialize_global_fts_index() -> dict[str, Any]:
 
             labels_union = "|".join(_quote_ident(l) for l in sorted(selected_labels))
             prop_list = ", ".join(
-                f"n.{_quote_ident(p)}" for p in sorted(selected_properties)
+                f"n.{p}" for p in sorted(selected_properties)
             )
 
             # Always drop-and-recreate so exclusion rule changes take effect.
