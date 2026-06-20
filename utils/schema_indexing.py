@@ -659,6 +659,74 @@ def _generate_description(generator_llm_client: Any, prompt: str) -> str:
     )
 
 
+def _fallback_relationship_description(
+    source_label: str,
+    relationship_type: str,
+    target_label: str,
+) -> str:
+    rel_phrase = relationship_type.replace("_", " ").lower()
+    return (
+        f"This relationship indicates how {source_label.lower()} entities "
+        f"are connected to {target_label.lower()} entities through "
+        f"{rel_phrase} in a business and news context."
+    )
+
+
+def _build_runtime_embedding_client() -> Any:
+    """Build a default embedding client for CLI relationship mode."""
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore[reportMissingImports]
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "Relationship mode requires 'sentence-transformers'. "
+            "Install it with: pip install sentence-transformers"
+        ) from exc
+
+    return SentenceTransformer(
+        EMBED_MODEL_NAME,
+        trust_remote_code=True,
+    )
+
+
+def _build_runtime_llm_client() -> Any | None:
+    """Build a default LLM client for CLI relationship mode.
+
+    If SCHEMA_LLM_PROVIDER=gemini and dependencies/env are present, a Gemini
+    client wrapper is returned. Otherwise returns None, which triggers a
+    deterministic semantic fallback description generator.
+    """
+    provider = os.getenv("SCHEMA_LLM_PROVIDER", "template").strip().lower()
+    if provider != "gemini":
+        return None
+
+    api_key = os.getenv("GOOGLE_API_KEY", "")
+    if not api_key:
+        raise ValueError(
+            "SCHEMA_LLM_PROVIDER=gemini requires GOOGLE_API_KEY in environment."
+        )
+
+    model_name = os.getenv("SCHEMA_LLM_MODEL", "gemini-1.5-flash")
+
+    try:
+        import google.generativeai as genai  # type: ignore[reportMissingImports]
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "Gemini provider requires google-generativeai. "
+            "Install it with: pip install google-generativeai"
+        ) from exc
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(model_name)
+
+    class _GeminiClient:
+        def invoke(self, prompt: str) -> str:
+            response = model.generate_content(prompt)
+            text = getattr(response, "text", None)
+            return str(text or "").strip()
+
+    return _GeminiClient()
+
+
 def _create_schema_relationship_vector_index(session) -> None:
     query = (
         "CREATE VECTOR INDEX schema_relationship_vector IF NOT EXISTS "
@@ -749,10 +817,17 @@ def index_relationship_schema_vectors(
                         source_properties=source_profile,
                         target_properties=target_profile,
                     )
-                    text_description = _generate_description(
-                        generator_llm_client,
-                        prompt,
-                    )
+                    if generator_llm_client is None:
+                        text_description = _fallback_relationship_description(
+                            source_label=source_label,
+                            relationship_type=relationship_type,
+                            target_label=target_label,
+                        )
+                    else:
+                        text_description = _generate_description(
+                            generator_llm_client,
+                            prompt,
+                        )
 
                     vector = _embed_texts(
                         embedding_model_client,
@@ -849,12 +924,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "skip embedding/index write. Requires code-level clients otherwise."
         ),
     )
+    parser.add_argument(
+        "--llm-provider",
+        choices=["template", "gemini"],
+        default=os.getenv("SCHEMA_LLM_PROVIDER", "template"),
+        help=(
+            "LLM provider for relationship mode. 'template' uses a local "
+            "deterministic fallback; 'gemini' uses GOOGLE_API_KEY."
+        ),
+    )
     return parser
 
 
 def _main() -> int:
     args = _build_arg_parser().parse_args()
     exit_code = 0
+
+    # Allow CLI argument to override env-driven default for this process.
+    os.environ["SCHEMA_LLM_PROVIDER"] = str(args.llm_provider)
 
     if args.mode in {"all", "fts"}:
         _stderr("[schema-indexing] Running unified global fulltext index init...")
@@ -876,14 +963,26 @@ def _main() -> int:
             )
             exit_code = 2
         else:
-            _stderr(
-                "[schema-indexing] Relationship mode needs runtime clients "
-                "(embedding_model_client and generator_llm_client). "
-                "Run programmatically, for example:\n"
-                "from utils.schema_indexing import index_relationship_schema_vectors\n"
-                "index_relationship_schema_vectors(embedding_client, llm_client)"
-            )
-            exit_code = 2
+            _stderr("[schema-indexing] Running relationship schema vector indexing...")
+            try:
+                embedding_client = _build_runtime_embedding_client()
+                llm_client = _build_runtime_llm_client()
+                rel_summary = index_relationship_schema_vectors(
+                    embedding_client,
+                    llm_client,
+                )
+                _stderr(
+                    "[schema-indexing] Relationship summary: "
+                    f"{_safe_json(rel_summary)}"
+                )
+                if rel_summary.get("errors"):
+                    exit_code = 1
+            except Exception as exc:  # noqa: BLE001
+                _stderr(
+                    "[schema-indexing] Relationship mode failed during runtime "
+                    f"client setup/execution: {str(exc)}"
+                )
+                exit_code = 2
 
     close_driver()
     return exit_code
