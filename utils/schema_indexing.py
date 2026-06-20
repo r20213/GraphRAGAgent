@@ -63,6 +63,8 @@ EXCLUDED_FTS_PROPERTIES = {
     "question",
     "embedding",
     "embed_model_name",
+    "motto",
+    "title",
 }
 
 _IDENTIFIER_KEYS = {
@@ -216,8 +218,23 @@ def initialize_global_fts_index() -> dict[str, Any]:
                 f"n.{_quote_ident(p)}" for p in sorted(selected_properties)
             )
 
+            # Always drop-and-recreate so exclusion rule changes take effect.
+            try:
+                session.run(
+                    "DROP INDEX global_entity_search IF EXISTS"
+                ).consume()
+                _stderr(
+                    "[schema-indexing] Dropped existing global_entity_search "
+                    "index (will recreate with current property set)."
+                )
+            except Neo4jError as drop_exc:
+                _stderr(
+                    "[schema-indexing] Warning: could not drop existing index: "
+                    f"{drop_exc.message if hasattr(drop_exc, 'message') else str(drop_exc)}"
+                )
+
             create_query = (
-                "CREATE FULLTEXT INDEX global_entity_search IF NOT EXISTS "
+                "CREATE FULLTEXT INDEX global_entity_search "
                 f"FOR (n:{labels_union}) "
                 f"ON EACH [{prop_list}]"
             )
