@@ -88,6 +88,10 @@ MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http").strip().lower()
 MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
 
+# Dense search embeddings configuration (Jina v5 nano relationships).
+EMBED_MODEL_NAME = "jinaai/jina-embeddings-v5-text-nano"
+EMBED_DIM = 512
+
 # Schema documentation. The server can be pointed at either the *original*
 # Neo4j database (described by ``utils/neo4j_schema.md``) or the migrated
 # *target* database (described by ``utils/neo4j_export_schema.md``). Both share
@@ -237,6 +241,45 @@ def close_driver(*_args: Any) -> None:
             _driver = None
 
 
+# --------------------------------------------------------------------------- #
+# Global embedding model (dense search) — initialised once, reused everywhere
+# --------------------------------------------------------------------------- #
+_embedding_model = None
+
+
+def get_embedding_model():
+    """Return the lazily-initialised embedding model singleton.
+    
+    Uses Jina v5 nano embeddings for semantic dense search over relationship
+    schemas. Model is loaded on first relationship search call; subsequent
+    calls reuse the same in-memory model to avoid repeated initialization.
+    """
+    global _embedding_model
+    if _embedding_model is None:
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore[reportMissingImports]
+        except ImportError as exc:
+            raise ImportError(
+                "Dense search requires 'sentence-transformers' package. "
+                "Install it with: pip install sentence-transformers"
+            ) from exc
+        
+        logger.info("Loading embedding model: %s", EMBED_MODEL_NAME)
+        try:
+            _embedding_model = SentenceTransformer(
+                EMBED_MODEL_NAME,
+                trust_remote_code=True,
+            )
+            logger.info(
+                "Embedding model loaded successfully (dimensions=%s).",
+                EMBED_DIM,
+            )
+        except Exception as exc:
+            logger.exception("Failed to load embedding model.")
+            raise
+    return _embedding_model
+
+
 def _handle_signal(signum: int, _frame: Any) -> None:
     """Signal handler that closes sockets before the process exits."""
     logger.info("Received signal %s; shutting down gracefully.", signum)
@@ -373,6 +416,9 @@ mcp = FastMCP(
         "global_entity_search index (covers Article.title, Article.author, "
         "Article.siteName, and .name on Person/Organization/City/Country/"
         "IndustryCategory). "
+        "Use search_relationships_by_query to find relationship types relevant "
+        "to a semantic query using dense vector search; this helps understand "
+        "which relationships exist before authoring Cypher traversals. "
         "Use run_graph_query for arbitrary read-only Cypher traversals. "
         "Use get_neo4j_schema to inspect labels, properties and relationships "
         "before authoring Cypher."
@@ -493,6 +539,133 @@ def search_entities_fts(
         )
 
     return _safe("search_entities_fts", _run)
+
+
+@mcp.tool()
+def search_relationships_by_query(
+    query: str,
+    top_k: int = 10,
+    agent_session_id: str | None = None,
+) -> str:
+    """Find relationship types relevant to a semantic query using dense search.
+
+    Searches the ``schema_relationship_vector`` index which contains embeddings
+    of semantic descriptions for all unique relationship types in the graph.
+    Each relationship is described as (source_label)-[type]->(target_label).
+
+    Results are ranked by embedding similarity (cosine) to the query embedding.
+    Each result includes:
+    - relationship_type: the Neo4j relationship type
+    - source_label, target_label: the node labels connected by this relationship
+    - text_description: semantic description of what this relationship represents
+    - similarity_score: vector similarity score (0–1, higher is better)
+    - relationship_count: number of instances of this relationship in the graph
+
+    Use this tool to understand which relationships are relevant before authoring
+    Cypher queries for graph traversals.
+    """
+
+    def _run() -> str:
+        # Embed the query with Jina using query-specific routing.
+        try:
+            model = get_embedding_model()
+        except Exception as exc:
+            return (
+                f"Failed to load embedding model: {str(exc)}. "
+                "Ensure 'sentence-transformers' is installed."
+            )
+
+        try:
+            import torch  # type: ignore[reportMissingImports]
+            with torch.inference_mode():
+                query_vector = model.encode(
+                    sentences=[query],
+                    batch_size=1,
+                    task="retrieval",
+                    prompt_name="query",  # Query-specific routing for Jina
+                    truncate_dim=EMBED_DIM,
+                    convert_to_numpy=False,
+                    show_progress_bar=False,
+                )[0]
+        except Exception:
+            # Fallback if torch is not available (e.g., CPU-only environment)
+            query_vector = model.encode(
+                sentences=[query],
+                task="retrieval",
+                prompt_name="query",
+                truncate_dim=EMBED_DIM,
+                convert_to_numpy=False,
+            )[0]
+
+        # Convert numpy array to Python list if needed
+        if hasattr(query_vector, "tolist"):
+            query_vector = query_vector.tolist()
+        else:
+            query_vector = list(query_vector)
+
+        # Search the schema_relationship_vector index.
+        vector_search_cypher = (
+            "CALL db.index.vector.queryNodes("
+            "'schema_relationship_vector', $top_k, $query_vector) "
+            "YIELD node, score "
+            "RETURN "
+            "  node.relationship_type AS relationship_type, "
+            "  node.source_label AS source_label, "
+            "  node.target_label AS target_label, "
+            "  node.text_description AS text_description, "
+            "  score AS similarity_score, "
+            "  node.metadata_json AS metadata_json"
+        )
+
+        try:
+            records = execute_read(
+                "search_relationships_by_query",
+                vector_search_cypher,
+                {"query_vector": query_vector, "top_k": top_k},
+                agent_session_id,
+                cap=top_k,
+            )
+        except Neo4jError as exc:
+            return (
+                f"Vector search failed: {exc.code or 'database error'}. "
+                "Ensure relationship schema indexing has been run "
+                "(python utils/schema_indexing.py --mode relationship)."
+            )
+
+        if not records:
+            return (
+                f"No relationships found matching the query: '{query}'. "
+                "Run schema indexing first: "
+                "python utils/schema_indexing.py --mode relationship"
+            )
+
+        # Enrich records with parsed metadata.
+        import json
+        enriched = []
+        for rec in records:
+            try:
+                metadata = json.loads(rec.get("metadata_json", "{}"))
+                relationship_count = metadata.get("relationship_count", 0)
+            except (json.JSONDecodeError, TypeError):
+                relationship_count = 0
+
+            enriched.append({
+                "relationship_type": rec.get("relationship_type"),
+                "source_label": rec.get("source_label"),
+                "target_label": rec.get("target_label"),
+                "text_description": rec.get("text_description"),
+                "similarity_score": float(rec.get("similarity_score", 0)),
+                "relationship_count": relationship_count,
+            })
+
+        payload = {
+            "query": query,
+            "record_count": len(enriched),
+            "records": enriched,
+        }
+        return json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+
+    return _safe("search_relationships_by_query", _run)
 
 
 @mcp.tool()
