@@ -68,7 +68,8 @@ EXCLUDED_FTS_PROPERTIES = {
 
 # Explicit FTS targets requested for the unified index.
 REQUIRED_FTS_TARGETS: dict[str, set[str]] = {
-    "Article": {"title", "author", "siteName"},
+    # "Article": {"title", "author", "siteName"},
+    "Article": {"author", "siteName"}, # Leaving out title for now.
     "Person": {"name"},
     "Organization": {"name"},
     "City": {"name"},
