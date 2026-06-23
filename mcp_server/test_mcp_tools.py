@@ -11,6 +11,9 @@ Usage examples
 # Run a full-text search with Lucene syntax and a custom result cap:
     python test_mcp_tools.py --fts "Apple~" --top-k 5
 
+# Search for relationships relevant to a semantic query:
+    python test_mcp_tools.py --search-relationships "financial reporting" --top-k 5
+
 # Execute an arbitrary read-only Cypher query:
     python test_mcp_tools.py --cypher "MATCH (o:Organization) RETURN o.name LIMIT 5"
 
@@ -84,6 +87,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--schema",
         action="store_true",
         help="Print the graph schema returned by get_neo4j_schema.",
+    )
+    parser.add_argument(
+        "--search-relationships",
+        metavar="QUERY",
+        help=(
+            "Search for relationship types relevant to a semantic query using "
+            "dense vector search. Query string should describe what relationships "
+            "you're looking for (e.g., 'financial reporting', 'company ownership')."
+        ),
     )
     return parser
 
@@ -160,8 +172,23 @@ async def _run(args: argparse.Namespace) -> int:
                 text = result.content[0].text if result.content else "(no content)"
                 print(text)
 
+            # ----------------------------------------------------------------
+            # --search-relationships
+            # ----------------------------------------------------------------
+            if args.search_relationships:
+                print(
+                    f"\n[search_relationships_by_query] query={args.search_relationships!r}, "
+                    f"top_k={args.top_k}"
+                )
+                result = await session.call_tool(
+                    "search_relationships_by_query",
+                    {"query": args.search_relationships, "top_k": args.top_k},
+                )
+                text = result.content[0].text if result.content else "(no content)"
+                print(_pretty(text))
+
             # Default: if no flags were given, just show tools
-            if not any([args.list, args.fts, args.cypher, args.schema]):
+            if not any([args.list, args.fts, args.cypher, args.schema, args.search_relationships]):
                 tools_response = await session.list_tools()
                 tool_names = [t.name for t in tools_response.tools]
                 print(
