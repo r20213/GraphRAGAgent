@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Iterable, cast
 
 from dotenv import load_dotenv
+from tqdm import tqdm  # type: ignore[reportMissingImports] 
 
 try:
     from neo4j import GraphDatabase  # type: ignore[reportMissingImports]
@@ -793,7 +794,7 @@ def index_relationship_schema_vectors(
                 "    n.updated_at = datetime()"
             )
 
-            for triple in triples:
+            for triple in tqdm(triples):
                 source_label = triple["source_label"]
                 relationship_type = triple["relationship_type"]
                 target_label = triple["target_label"]
